@@ -1,0 +1,171 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+version: "3"
+
+vars:
+  BINARY: photo-migrator
+  BUILD_DIR: .
+  CMD_PKG: ./cmd/photo-migrator
+  LDFLAGS: >-
+    -ldflags "-s -w
+    -X main.version={{.VERSION}}"
+  VERSION:
+    sh: git describe --tags --always --dirty 2>/dev/null || echo "dev"
+
+env:
+  CGO_ENABLED: "0"   # pure-Go build (modernc.org/sqlite requires no CGO)
+
+tasks:
+  # ─────────────────────────────────────────────
+  # Default — show available tasks
+  # ─────────────────────────────────────────────
+  default:
+    desc: List all available tasks
+    cmds:
+      - task --list
+    silent: true
+
+  # ─────────────────────────────────────────────
+  # Setup
+  # ─────────────────────────────────────────────
+  setup:
+    desc: Install all project tools via mise (golangci-lint, sqlite3, task)
+    cmds:
+      - mise install
+    preconditions:
+      - sh: which mise
+        msg: "mise is not installed — see https://mise.jdx.dev/getting-started.html"
+
+  # ─────────────────────────────────────────────
+  # Dependencies
+  # ─────────────────────────────────────────────
+  deps:
+    desc: Download and tidy Go module dependencies
+    cmds:
+      - go mod download
+      - go mod tidy
+    sources:
+      - go.mod
+      - go.sum
+
+  # ─────────────────────────────────────────────
+  # Build
+  # ─────────────────────────────────────────────
+  build:
+    desc: Build the photo-migrator binary
+    deps: [deps]
+    cmds:
+      - go build {{.LDFLAGS}} -o {{.BUILD_DIR}}/{{.BINARY}} {{.CMD_PKG}}
+      - echo "✓ Built {{.BUILD_DIR}}/{{.BINARY}} ({{.VERSION}})"
+    sources:
+      - "**/*.go"
+      - go.mod
+      - go.sum
+    generates:
+      - "{{.BUILD_DIR}}/{{.BINARY}}"
+
+  build:race:
+    desc: Build with the race detector enabled (for development/testing)
+    cmds:
+      - CGO_ENABLED=1 go build -race -o {{.BUILD_DIR}}/{{.BINARY}}-race {{.CMD_PKG}}
+      - echo "✓ Built {{.BUILD_DIR}}/{{.BINARY}}-race (race detector enabled)"
+
+  # ─────────────────────────────────────────────
+  # Test
+  # ─────────────────────────────────────────────
+  test:
+    desc: Run all unit tests
+    cmds:
+      - go test -v -count=1 ./...
+
+  test:cover:
+    desc: Run tests and open an HTML coverage report
+    cmds:
+      - go test -coverprofile=coverage.out ./...
+      - go tool cover -html=coverage.out -o coverage.html
+      - echo "Coverage report → coverage.html"
+
+  # ─────────────────────────────────────────────
+  # Lint / Format
+  # ─────────────────────────────────────────────
+  fmt:
+    desc: Format all Go source files
+    cmds:
+      - gofmt -w .
+
+  vet:
+    desc: Run go vet on all packages
+    cmds:
+      - go vet ./...
+
+  lint:
+    desc: Run golangci-lint on all packages
+    cmds:
+      - golangci-lint run ./...
+    preconditions:
+      - sh: which golangci-lint
+        msg: "golangci-lint not found — run 'task setup' to install via mise"
+
+  # ─────────────────────────────────────────────
+  # DB inspection helpers (requires mise-installed sqlite3)
+  # ─────────────────────────────────────────────
+  db:status:
+    desc: Show per-status counts from migrator.db
+    vars:
+      DB: '{{.DB | default "migrator.db"}}'
+    cmds:
+      - sqlite3 {{.DB}} "SELECT status, COUNT(*) as count FROM media_items GROUP BY status ORDER BY status"
+    preconditions:
+      - sh: test -f {{.DB | default "migrator.db"}}
+        msg: "No database found at {{.DB | default \"migrator.db\"}} — run 'photo-migrator run' first."
+
+  db:zips:
+    desc: Show all zip archive statuses from migrator.db
+    vars:
+      DB: '{{.DB | default "migrator.db"}}'
+    cmds:
+      - sqlite3 {{.DB}} "SELECT zip_path, status, error_msg FROM zip_archives ORDER BY zip_path"
+
+  db:errors:
+    desc: List media items that have errors
+    vars:
+      DB: '{{.DB | default "migrator.db"}}'
+    cmds:
+      - sqlite3 {{.DB}} "SELECT source_path, error_message FROM media_items WHERE status='error' ORDER BY source_path"
+
+  db:shell:
+    desc: Open an interactive sqlite3 shell on migrator.db
+    vars:
+      DB: '{{.DB | default "migrator.db"}}'
+    cmds:
+      - sqlite3 {{.DB}}
+    interactive: true
+
+  # ─────────────────────────────────────────────
+  # Clean
+  # ─────────────────────────────────────────────
+  clean:
+    desc: Remove the built binary and coverage artifacts
+    cmds:
+      - rm -f {{.BUILD_DIR}}/{{.BINARY}} {{.BUILD_DIR}}/{{.BINARY}}-race
+      - rm -f coverage.out coverage.html
+      - echo "✓ Cleaned"
+
+  clean:staging:
+    desc: Remove the _staging directory (temporary zip extraction files)
+    cmds:
+      - rm -rf ./_staging
+      - echo "✓ Staging directory removed"
+
+  clean:all:
+    desc: Remove binary, coverage artifacts, and staging directory
+    deps: [clean, clean:staging]
+
+  # ─────────────────────────────────────────────
+  # CI — run everything
+  # ─────────────────────────────────────────────
+  ci:
+    desc: Full CI pipeline — lint, test, build
+    cmds:
+      - task: lint
+      - task: test
+      - task: build

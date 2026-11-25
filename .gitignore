@@ -1,0 +1,20 @@
+# Build output
+/photo-migrator
+/photo-migrator-race
+
+# Test coverage
+coverage.out
+coverage.html
+
+# Task runner cache
+.task/
+
+# Local migration state (SQLite ledger and zip extraction scratch space)
+*.db
+*.db-wal
+*.db-shm
+_staging/
+
+# OAuth secrets — never commit
+credentials.json
+token.json

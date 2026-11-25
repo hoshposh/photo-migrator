@@ -1,0 +1,195 @@
+// Package auth implements OAuth2 authentication for the Google Photos API
+// using a loopback redirect flow suitable for desktop CLI applications.
+package auth
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"time"
+
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
+)
+
+// Scopes requested from the Google Photos Library API.
+// The legacy "photoslibrary" scope is deprecated; the API now requires
+// granular scopes:
+//   - appendonly: upload new media items
+//   - edit.appcreateddata: create albums and add app-uploaded items to them
+var Scopes = []string{
+	"https://www.googleapis.com/auth/photoslibrary.appendonly",
+	"https://www.googleapis.com/auth/photoslibrary.edit.appcreateddata",
+}
+
+// LoadConfig reads an OAuth2 credentials.json file downloaded from the
+// Google Cloud Console and returns a configured *oauth2.Config.
+func LoadConfig(credentialsPath string) (*oauth2.Config, error) {
+	data, err := os.ReadFile(credentialsPath)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", credentialsPath, err)
+	}
+	cfg, err := google.ConfigFromJSON(data, Scopes...)
+	if err != nil {
+		return nil, fmt.Errorf("parse credentials: %w", err)
+	}
+	return cfg, nil
+}
+
+// GetClient returns an authenticated *http.Client for the Google Photos API.
+//
+// On the first call it runs the loopback OAuth2 flow (opens a browser window)
+// and caches the resulting token to ~/.config/photo-migrator/token.json.
+// Subsequent calls load the cached token, refreshing it automatically when
+// it expires.
+func GetClient(ctx context.Context, cfg *oauth2.Config) (*http.Client, error) {
+	tokenPath, err := tokenCachePath()
+	if err != nil {
+		return nil, err
+	}
+
+	// Use the cached token if available.
+	if tok, err := loadToken(tokenPath); err == nil {
+		return cfg.Client(ctx, tok), nil
+	}
+
+	// Run the interactive loopback flow.
+	tok, err := runLoopbackFlow(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := saveToken(tokenPath, tok); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not cache token: %v\n", err)
+	} else {
+		fmt.Printf("Token cached to %s\n", tokenPath)
+	}
+	return cfg.Client(ctx, tok), nil
+}
+
+// runLoopbackFlow starts an ephemeral local HTTP server, opens the system
+// browser to the Google authorization page, and waits (up to 3 min) for the
+// redirect containing the authorization code.
+func runLoopbackFlow(ctx context.Context, cfg *oauth2.Config) (*oauth2.Token, error) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, fmt.Errorf("listen: %w", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	cfg.RedirectURL = fmt.Sprintf("http://127.0.0.1:%d/callback", port)
+
+	codeCh := make(chan string, 1)
+	errCh := make(chan error, 1)
+
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			code := r.URL.Query().Get("code")
+			if code == "" {
+				errCh <- fmt.Errorf("authorization failed: %s", r.URL.RawQuery)
+				http.Error(w, "authorization failed", http.StatusBadRequest)
+				return
+			}
+			_, _ = fmt.Fprintln(w, `<html><body style="font-family:sans-serif;padding:2em">
+				<h2>✓ Authorization complete</h2>
+				<p>You may close this tab and return to the terminal.</p>
+			</body></html>`)
+			codeCh <- code
+		}),
+	}
+
+	go func() {
+		if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
+			select {
+			case errCh <- err:
+			default:
+			}
+		}
+	}()
+	defer srv.Shutdown(context.Background()) //nolint:errcheck
+
+	authURL := cfg.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
+	fmt.Println("\nOpening browser for Google Photos authorization (Account B)...")
+	fmt.Println("If the browser does not open automatically, visit this URL:")
+	fmt.Println(" ", authURL)
+	openBrowser(authURL)
+
+	flowCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+
+	select {
+	case code := <-codeCh:
+		tok, err := cfg.Exchange(flowCtx, code)
+		if err != nil {
+			return nil, fmt.Errorf("exchange code: %w", err)
+		}
+		return tok, nil
+	case err := <-errCh:
+		return nil, err
+	case <-flowCtx.Done():
+		return nil, fmt.Errorf("authorization timed out after 3 minutes")
+	}
+}
+
+// openBrowser opens url in the default system browser.
+func openBrowser(url string) {
+	var cmd string
+	var args []string
+	switch runtime.GOOS {
+	case "darwin":
+		cmd, args = "open", []string{url}
+	case "windows":
+		cmd, args = "cmd", []string{"/c", "start", url}
+	default: // Linux / WSL
+		cmd, args = "xdg-open", []string{url}
+	}
+	exec.Command(cmd, args...).Start() //nolint:errcheck
+}
+
+// tokenCachePath returns the path to the cached OAuth2 token file.
+func tokenCachePath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(home, ".config", "photo-migrator")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("create token dir: %w", err)
+	}
+	return filepath.Join(dir, "token.json"), nil
+}
+
+func loadToken(path string) (_ *oauth2.Token, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if cerr := f.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
+
+	var tok oauth2.Token
+	if err := json.NewDecoder(f).Decode(&tok); err != nil {
+		return nil, fmt.Errorf("decode token: %w", err)
+	}
+	return &tok, nil
+}
+
+func saveToken(path string, tok *oauth2.Token) (err error) {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := f.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
+	return json.NewEncoder(f).Encode(tok)
+}

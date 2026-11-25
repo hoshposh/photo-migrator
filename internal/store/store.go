@@ -1,0 +1,370 @@
+// Package store manages the SQLite state ledger used to track migration
+// progress across interrupted runs.
+//
+// Schema migrations are handled by pressly/goose with SQL files embedded
+// directly into the binary. To add a future schema change, create a new
+// numbered file under migrations/ (e.g. 00002_add_column.sql) in goose
+// format and rebuild — goose applies only unapplied migrations on startup.
+package store
+
+import (
+	"database/sql"
+	"embed"
+	"fmt"
+
+	"github.com/pressly/goose/v3"
+	_ "modernc.org/sqlite" // registers the "sqlite" driver
+)
+
+//go:embed migrations/*.sql
+var embedMigrations embed.FS
+
+// Status values for zip_archives and media_items rows.
+type Status string
+
+const (
+	StatusPending       Status = "pending"
+	StatusExtracting    Status = "extracting"
+	StatusUploading     Status = "uploading"
+	StatusBytesUploaded Status = "bytes_uploaded"
+	StatusComplete      Status = "complete"
+	StatusError         Status = "error"
+)
+
+// Store wraps the SQLite database.
+type Store struct {
+	db *sql.DB
+}
+
+// Open opens (or creates) the SQLite database at path, then runs any pending
+// goose migrations.
+func Open(path string) (*Store, error) {
+	db, err := sql.Open("sqlite", fmt.Sprintf("%s?_journal_mode=WAL&_busy_timeout=5000", path))
+	if err != nil {
+		return nil, fmt.Errorf("open db: %w", err)
+	}
+	// Serialise writers — SQLite only supports one concurrent writer.
+	db.SetMaxOpenConns(1)
+
+	s := &Store{db: db}
+	if err := s.runMigrations(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
+	return s, nil
+}
+
+func (s *Store) runMigrations() error {
+	goose.SetBaseFS(embedMigrations)
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		return err
+	}
+	// Suppress goose's default stdout logging.
+	goose.SetLogger(goose.NopLogger())
+	return goose.Up(s.db, "migrations")
+}
+
+// Close closes the underlying database.
+func (s *Store) Close() error { return s.db.Close() }
+
+// ─────────────────────────────────────────────────────────────
+// Zip archive operations
+// ─────────────────────────────────────────────────────────────
+
+// RegisterZip adds a zip path to the ledger if not already present.
+// Safe to call repeatedly — uses INSERT OR IGNORE semantics.
+func (s *Store) RegisterZip(zipPath string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO zip_archives (zip_path) VALUES (?) ON CONFLICT(zip_path) DO NOTHING`,
+		zipPath,
+	)
+	return err
+}
+
+// GetPendingZips returns all zip archive paths not yet marked complete,
+// ordered alphabetically for deterministic processing.
+func (s *Store) GetPendingZips() ([]string, error) {
+	rows, err := s.db.Query(
+		`SELECT zip_path FROM zip_archives WHERE status != 'complete' ORDER BY zip_path ASC`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var paths []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		paths = append(paths, p)
+	}
+	return paths, rows.Err()
+}
+
+// SetZipStatus updates the status (and optional error message) for a zip.
+func (s *Store) SetZipStatus(zipPath string, status Status, errMsg string) error {
+	_, err := s.db.Exec(
+		`UPDATE zip_archives
+		    SET status = ?, error_msg = ?, updated_at = CURRENT_TIMESTAMP
+		  WHERE zip_path = ?`,
+		string(status), errMsg, zipPath,
+	)
+	return err
+}
+
+// AllZipItemsComplete returns true when every media_item for the given zip has
+// status = 'complete'.
+func (s *Store) AllZipItemsComplete(zipPath string) (bool, error) {
+	var pending int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM media_items WHERE source_zip = ? AND status != 'complete'`,
+		zipPath,
+	).Scan(&pending)
+	return pending == 0, err
+}
+
+// ─────────────────────────────────────────────────────────────
+// Media item operations
+// ─────────────────────────────────────────────────────────────
+
+// MediaItem is the projection used by the upload pipeline.
+type MediaItem struct {
+	SourcePath  string
+	SourceZip   string
+	AlbumName   string
+	UploadToken string
+	Status      Status
+}
+
+// RegisterMedia adds a media item to the ledger if not already present.
+func (s *Store) RegisterMedia(sourcePath, sourceZip, albumName string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO media_items (source_path, source_zip, album_name)
+		      VALUES (?, ?, ?)
+		      ON CONFLICT(source_path) DO NOTHING`,
+		sourcePath, nullStr(sourceZip), nullStr(albumName),
+	)
+	return err
+}
+
+// IsUploaded returns true if the given source path is already complete.
+func (s *Store) IsUploaded(sourcePath string) (bool, error) {
+	var status string
+	err := s.db.QueryRow(
+		`SELECT status FROM media_items WHERE source_path = ?`, sourcePath,
+	).Scan(&status)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return Status(status) == StatusComplete, nil
+}
+
+// SetMediaUploadToken records the upload token after the byte-upload step.
+func (s *Store) SetMediaUploadToken(sourcePath, uploadToken string) error {
+	_, err := s.db.Exec(
+		`UPDATE media_items
+		    SET status = ?, upload_token = ?, updated_at = CURRENT_TIMESTAMP
+		  WHERE source_path = ?`,
+		string(StatusBytesUploaded), uploadToken, sourcePath,
+	)
+	return err
+}
+
+// SetMediaComplete records the Google Photos media ID on successful creation.
+func (s *Store) SetMediaComplete(sourcePath, photosMediaID string) error {
+	_, err := s.db.Exec(
+		`UPDATE media_items
+		    SET status = ?, photos_media_id = ?, updated_at = CURRENT_TIMESTAMP
+		  WHERE source_path = ?`,
+		string(StatusComplete), photosMediaID, sourcePath,
+	)
+	return err
+}
+
+// SetMediaError records a terminal error for a media item.
+func (s *Store) SetMediaError(sourcePath, errMsg string) error {
+	_, err := s.db.Exec(
+		`UPDATE media_items
+		    SET status = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP
+		  WHERE source_path = ?`,
+		string(StatusError), errMsg, sourcePath,
+	)
+	return err
+}
+
+// GetPendingMedia returns all non-complete media items (used in dir mode).
+func (s *Store) GetPendingMedia() ([]MediaItem, error) {
+	return s.queryMedia(
+		`SELECT source_path,
+		        COALESCE(source_zip, ''),
+		        COALESCE(album_name, ''),
+		        COALESCE(upload_token, ''),
+		        status
+		   FROM media_items
+		  WHERE status != 'complete'
+		  ORDER BY id ASC`,
+	)
+}
+
+// LargeFileItem is returned by GetLargeFileErrors and holds enough context
+// for the user to locate and manually upload a file that exceeded the
+// Google Photos API size limit.
+type LargeFileItem struct {
+	SourcePath string
+	SourceZip  string // empty in dir mode
+	AlbumName  string
+	ErrorMsg   string
+}
+
+// GetLargeFileErrors returns all media_items that failed because the file was
+// too large for the Google Photos API (HTTP 413 / "Uploaded photo must not
+// have more than N bytes").
+func (s *Store) GetLargeFileErrors() ([]LargeFileItem, error) {
+	rows, err := s.db.Query(`
+		SELECT source_path,
+		       COALESCE(source_zip, ''),
+		       COALESCE(album_name, ''),
+		       COALESCE(error_message, '')
+		  FROM media_items
+		 WHERE status = 'error'
+		   AND (error_message LIKE '%HTTP 413%'
+		     OR error_message LIKE '%too large%'
+		     OR error_message LIKE '%exceeds%'
+		     OR error_message LIKE '%FILE_SIZE_TOO_LARGE%')
+		 ORDER BY source_zip ASC, source_path ASC`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var items []LargeFileItem
+	for rows.Next() {
+		var it LargeFileItem
+		if err := rows.Scan(&it.SourcePath, &it.SourceZip, &it.AlbumName, &it.ErrorMsg); err != nil {
+			return nil, err
+		}
+		items = append(items, it)
+	}
+	return items, rows.Err()
+}
+
+func (s *Store) queryMedia(query string, args ...any) ([]MediaItem, error) {
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var items []MediaItem
+	for rows.Next() {
+		var m MediaItem
+		if err := rows.Scan(
+			&m.SourcePath, &m.SourceZip, &m.AlbumName, &m.UploadToken, &m.Status,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, m)
+	}
+	return items, rows.Err()
+}
+
+// ─────────────────────────────────────────────────────────────
+// Album operations
+// ─────────────────────────────────────────────────────────────
+
+// GetAlbumID returns the Google Photos album ID for the given album name.
+// The second return value is false if the album has not yet been created.
+func (s *Store) GetAlbumID(name string) (string, bool, error) {
+	var id string
+	err := s.db.QueryRow(
+		`SELECT COALESCE(photos_album_id, '')
+		   FROM albums
+		  WHERE source_name = ? AND status = 'complete'`,
+		name,
+	).Scan(&id)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	return id, id != "", err
+}
+
+// UpsertAlbum ensures the album name is registered in the ledger.
+func (s *Store) UpsertAlbum(name string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO albums (source_name) VALUES (?) ON CONFLICT(source_name) DO NOTHING`,
+		name,
+	)
+	return err
+}
+
+// SetAlbumComplete records the Google Photos album ID for a source album.
+func (s *Store) SetAlbumComplete(name, albumID string) error {
+	_, err := s.db.Exec(
+		`UPDATE albums SET photos_album_id = ?, status = 'complete' WHERE source_name = ?`,
+		albumID, name,
+	)
+	return err
+}
+
+// ─────────────────────────────────────────────────────────────
+// Stats
+// ─────────────────────────────────────────────────────────────
+
+// Stats holds progress counters for the status command.
+type Stats struct {
+	TotalZips      int
+	CompleteZips   int
+	TotalMedia     int
+	CompleteMedia  int
+	PendingMedia   int
+	ErrorMedia     int
+	TotalAlbums    int
+	CompleteAlbums int
+}
+
+// GetStats returns current progress counts.
+func (s *Store) GetStats() (*Stats, error) {
+	st := &Stats{}
+
+	if err := s.db.QueryRow(`
+		SELECT COUNT(*),
+		       COALESCE(SUM(CASE WHEN status='complete' THEN 1 ELSE 0 END), 0)
+		  FROM zip_archives`,
+	).Scan(&st.TotalZips, &st.CompleteZips); err != nil {
+		return nil, fmt.Errorf("stats zip_archives: %w", err)
+	}
+
+	if err := s.db.QueryRow(`
+		SELECT COUNT(*),
+		       COALESCE(SUM(CASE WHEN status='complete'                         THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN status IN ('pending','bytes_uploaded')    THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN status='error'                            THEN 1 ELSE 0 END), 0)
+		  FROM media_items`,
+	).Scan(&st.TotalMedia, &st.CompleteMedia, &st.PendingMedia, &st.ErrorMedia); err != nil {
+		return nil, fmt.Errorf("stats media_items: %w", err)
+	}
+
+	if err := s.db.QueryRow(`
+		SELECT COUNT(*),
+		       COALESCE(SUM(CASE WHEN status='complete' THEN 1 ELSE 0 END), 0)
+		  FROM albums`,
+	).Scan(&st.TotalAlbums, &st.CompleteAlbums); err != nil {
+		return nil, fmt.Errorf("stats albums: %w", err)
+	}
+
+	return st, nil
+}
+
+// nullStr converts an empty string to a nil interface (stored as SQL NULL).
+func nullStr(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}

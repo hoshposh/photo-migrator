@@ -1,0 +1,6 @@
+[tools]
+# Install all project tools with: mise install
+go            = "1.26.11" # keep in sync with the `go` directive in go.mod
+golangci-lint = "latest"  # Go linter aggregator (https://golangci-lint.run)
+sqlite        = "latest"  # CLI for inspecting the migrator.db state ledger
+task          = "latest"  # Taskfile build runner (https://taskfile.dev)
