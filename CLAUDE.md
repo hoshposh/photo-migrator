@@ -23,7 +23,7 @@ go test -run TestRestoreMetadata_GPS ./internal/metadata/   # a single test
 task db:status | db:zips | db:errors | db:shell    # inspect migrator.db (DB=path to override)
 ```
 
-- Tests live in `internal/metadata` and `cmd/photo-migrator`. The metadata tests run the real `exiftool` binary and fail if it isn't installed. The command tests run the full Cobra tree with a temporary `HOME` and working directory; reuse their `execute` helper, which resets the global viper state.
+- Tests live in `internal/metadata`, `internal/auth` and `cmd/photo-migrator`. The metadata tests run the real `exiftool` binary and fail if it isn't installed. The command tests run the full Cobra tree with a temporary `HOME` and working directory; reuse their `execute` helper, which resets the global viper state. The auth tests run the real sign-in flow against a fake token server, with the package variable `openBrowser` replaced by a fake browser.
 - To try the CLI safely, give it its own `--db-path` and `HOME` so it doesn't touch the real ledger, config or OAuth token.
 
 ## Architecture
@@ -51,7 +51,7 @@ The flow is: `cmd/photo-migrator/main.go` (Cobra commands plus all the orchestra
 - **Restoring metadata** (`restore-metadata`, on by default) runs `exiftool -overwrite_original` to write the date/time and GPS position from the sidecar into the file before upload. Errors are logged and the upload continues. In dir mode this **changes the user's original files**.
 - **Errors for files that are too large** are recognised only by pattern-matching `error_message` text in `store.GetLargeFileErrors` (`HTTP 413`, `too large`, …). If you change the wording of upload errors, keep these patterns matching.
 - **Schema** changes are goose SQL files in `internal/store/migrations/`, embedded with `//go:embed` and applied when the DB is opened. Add a new numbered file; never edit `00001_initial.sql`. The DB is opened with `MaxOpenConns(1)`, so all writes go through one connection.
-- **OAuth** (`internal/auth`): a loopback redirect flow. The token is cached at `~/.config/photo-migrator/token.json`. The scopes are `photoslibrary.appendonly` and `photoslibrary.edit.appcreateddata`. If you change them, also update the OAuth consent-screen steps in the README.
+- **OAuth** (`internal/auth`): a loopback redirect flow. Each sign-in uses a random `state`, which the callback checks before accepting a code, and PKCE (`S256`), so the code exchange must present the matching verifier. Keep both if you change the flow. The token is cached at `~/.config/photo-migrator/token.json`. The scopes are `photoslibrary.appendonly` and `photoslibrary.edit.appcreateddata`. If you change them, also update the OAuth consent-screen steps in the README.
 
 ## Configuration and known pitfalls
 

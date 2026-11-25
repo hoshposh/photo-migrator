@@ -4,6 +4,8 @@ package auth
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -83,14 +85,32 @@ func runLoopbackFlow(ctx context.Context, cfg *oauth2.Config) (*oauth2.Token, er
 	port := listener.Addr().(*net.TCPAddr).Port
 	cfg.RedirectURL = fmt.Sprintf("http://127.0.0.1:%d/callback", port)
 
+	// state binds the callback to this flow (prevents login CSRF); the PKCE
+	// verifier binds the code exchange to this process, so an intercepted
+	// authorization code is useless on its own.
+	state := rand.Text()
+	verifier := oauth2.GenerateVerifier()
+
 	codeCh := make(chan string, 1)
 	errCh := make(chan error, 1)
 
 	srv := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			code := r.URL.Query().Get("code")
+			q := r.URL.Query()
+			if subtle.ConstantTimeCompare([]byte(q.Get("state")), []byte(state)) != 1 {
+				select {
+				case errCh <- fmt.Errorf("authorization failed: state mismatch (possible forged redirect)"):
+				default:
+				}
+				http.Error(w, "authorization failed: state mismatch", http.StatusBadRequest)
+				return
+			}
+			code := q.Get("code")
 			if code == "" {
-				errCh <- fmt.Errorf("authorization failed: %s", r.URL.RawQuery)
+				select {
+				case errCh <- fmt.Errorf("authorization failed: %s", r.URL.RawQuery):
+				default:
+				}
 				http.Error(w, "authorization failed", http.StatusBadRequest)
 				return
 			}
@@ -98,7 +118,10 @@ func runLoopbackFlow(ctx context.Context, cfg *oauth2.Config) (*oauth2.Token, er
 				<h2>✓ Authorization complete</h2>
 				<p>You may close this tab and return to the terminal.</p>
 			</body></html>`)
-			codeCh <- code
+			select {
+			case codeCh <- code:
+			default: // a code was already received; ignore repeats
+			}
 		}),
 	}
 
@@ -112,7 +135,7 @@ func runLoopbackFlow(ctx context.Context, cfg *oauth2.Config) (*oauth2.Token, er
 	}()
 	defer srv.Shutdown(context.Background()) //nolint:errcheck
 
-	authURL := cfg.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
+	authURL := cfg.AuthCodeURL(state, oauth2.AccessTypeOffline, oauth2.S256ChallengeOption(verifier))
 	fmt.Println("\nOpening browser for Google Photos authorization (Account B)...")
 	fmt.Println("If the browser does not open automatically, visit this URL:")
 	fmt.Println(" ", authURL)
@@ -123,7 +146,7 @@ func runLoopbackFlow(ctx context.Context, cfg *oauth2.Config) (*oauth2.Token, er
 
 	select {
 	case code := <-codeCh:
-		tok, err := cfg.Exchange(flowCtx, code)
+		tok, err := cfg.Exchange(flowCtx, code, oauth2.VerifierOption(verifier))
 		if err != nil {
 			return nil, fmt.Errorf("exchange code: %w", err)
 		}
@@ -135,8 +158,9 @@ func runLoopbackFlow(ctx context.Context, cfg *oauth2.Config) (*oauth2.Token, er
 	}
 }
 
-// openBrowser opens url in the default system browser.
-func openBrowser(url string) {
+// openBrowser opens url in the default system browser. It is a variable so
+// tests can stand in for the browser.
+var openBrowser = func(url string) {
 	var cmd string
 	var args []string
 	switch runtime.GOOS {
