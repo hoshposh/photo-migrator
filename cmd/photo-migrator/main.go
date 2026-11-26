@@ -515,7 +515,7 @@ Flags:
 					Error:     it.ErrorMsg,
 				}
 				if it.SourceZip != "" {
-					rep.InZipPath = inZipPath(it.SourcePath, it.SourceZip)
+					rep.InZipPath = zipEntryOf(it)
 				}
 				reports = append(reports, rep)
 			}
@@ -528,7 +528,7 @@ Flags:
 				// Annotate each report with where the file landed.
 				for i, it := range items {
 					if it.SourceZip != "" {
-						inZip := inZipPath(it.SourcePath, it.SourceZip)
+						inZip := zipEntryOf(it)
 						reports[i].ExtractedTo = filepath.Join(extractDir, filepath.FromSlash(inZip))
 					} else {
 						// Dir mode: original path is stable.
@@ -550,6 +550,15 @@ Flags:
 	cmd.Flags().StringVar(&extractDir, "extract", "",
 		"re-extract large files from their source zips into this directory")
 	return cmd
+}
+
+// zipEntryOf returns the item's path inside its source zip: the recorded
+// zip_entry, or (for rows predating that column) one derived from source_path.
+func zipEntryOf(it store.LargeFileItem) string {
+	if it.ZipEntry != "" {
+		return it.ZipEntry
+	}
+	return inZipPath(it.SourcePath, it.SourceZip)
 }
 
 // inZipPath derives the relative path of a file inside its source zip by
@@ -592,7 +601,7 @@ func extractLargeFiles(items []store.LargeFileItem, destDir string, logger *zap.
 		}
 		zipGroups[it.SourceZip] = append(zipGroups[it.SourceZip], entry{
 			item:  it,
-			inZip: inZipPath(it.SourcePath, it.SourceZip),
+			inZip: zipEntryOf(it),
 		})
 	}
 
@@ -977,12 +986,14 @@ func processDirectory(ctx context.Context, dir, sourceZip string, st *store.Stor
 
 	go func() {
 		defer close(jobs)
-		err := takeout.WalkDirectory(walkCtx, dir, sourceZip, st.IsDone, func(j takeout.MigrationJob) {
+		err := takeout.WalkDirectory(walkCtx, dir, sourceZip, func(path, zipEntry string) (bool, error) {
+			return st.IsDone(sourceZip, zipEntry, path)
+		}, func(j takeout.MigrationJob) {
 			// Register in DB before handing off to the worker pool. Skipped on
 			// dry runs: rows are keyed by (staging) path, and rows a real run
 			// never revisits would keep their zip incomplete forever.
 			if !pool.DryRun() {
-				if err := st.RegisterMedia(j.MediaPath, j.SourceZip, j.AlbumName); err != nil {
+				if err := st.RegisterMedia(j.MediaPath, j.SourceZip, j.ZipEntry, j.AlbumName); err != nil {
 					logger.Warn("register media", zap.String("path", j.MediaPath), zap.Error(err))
 				}
 			}

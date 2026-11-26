@@ -28,6 +28,10 @@ type MigrationJob struct {
 	AlbumName string
 	// SourceZip is the originating zip archive path (empty in dir mode).
 	SourceZip string
+	// ZipEntry is the file's path inside SourceZip, with forward slashes
+	// (empty in dir mode). Together with SourceZip it identifies the file in
+	// the ledger independently of where the zip was extracted.
+	ZipEntry string
 	// Sidecar holds the parsed metadata (nil if not found).
 	Sidecar *Sidecar
 }
@@ -165,8 +169,10 @@ func (c *ctxReader) Read(p []byte) (int, error) {
 // media file that has not already been uploaded. It stops and returns
 // ctx.Err() as soon as ctx is cancelled.
 //
-// isDone is called for every media file found; if it returns true the file
-// needs no upload (already uploaded, or permanently too large) and is skipped.
+// isDone is called with each media file's path and zip entry (its path
+// relative to dir, which is the path inside the zip when sourceZip is set);
+// if it returns true the file needs no upload (already uploaded, or
+// permanently too large) and is skipped.
 //
 // emit is the callback that receives each MigrationJob. Typically the caller
 // uses a closure that registers the item in the store and forwards it to a
@@ -174,7 +180,7 @@ func (c *ctxReader) Read(p []byte) (int, error) {
 func WalkDirectory(
 	ctx context.Context,
 	dir, sourceZip string,
-	isDone func(string) (bool, error),
+	isDone func(path, zipEntry string) (bool, error),
 	emit func(MigrationJob),
 	logger *zap.Logger,
 ) error {
@@ -190,7 +196,14 @@ func WalkDirectory(
 			return nil
 		}
 
-		done, err := isDone(path)
+		zipEntry := ""
+		if sourceZip != "" {
+			if rel, rerr := filepath.Rel(dir, path); rerr == nil {
+				zipEntry = filepath.ToSlash(rel)
+			}
+		}
+
+		done, err := isDone(path, zipEntry)
 		if err != nil {
 			return fmt.Errorf("check uploaded %s: %w", path, err)
 		}
@@ -208,6 +221,7 @@ func WalkDirectory(
 			SidecarPath: sidecarPath,
 			AlbumName:   albumFromPath(path, dir),
 			SourceZip:   sourceZip,
+			ZipEntry:    zipEntry,
 			Sidecar:     sidecar,
 		})
 		return nil

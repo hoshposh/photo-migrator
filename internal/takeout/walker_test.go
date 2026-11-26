@@ -71,7 +71,7 @@ func TestWalkDirectory_StopsWhenCancelled(t *testing.T) {
 
 	emitted := 0
 	err := WalkDirectory(ctx, dir, "",
-		func(string) (bool, error) { return false, nil },
+		func(string, string) (bool, error) { return false, nil },
 		func(MigrationJob) { emitted++ },
 		zap.NewNop(),
 	)

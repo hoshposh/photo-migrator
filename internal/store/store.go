@@ -142,23 +142,48 @@ type MediaItem struct {
 }
 
 // RegisterMedia adds a media item to the ledger if not already present.
-func (s *Store) RegisterMedia(sourcePath, sourceZip, albumName string) error {
+//
+// Zip-mode items (sourceZip != "") are identified by (sourceZip, zipEntry),
+// the file's path inside its zip, so the staging directory can change between
+// runs. If the entry is already known, its source_path is refreshed to the
+// current staging path (status updates look rows up by source_path).
+// Directory-mode items are identified by sourcePath.
+func (s *Store) RegisterMedia(sourcePath, sourceZip, zipEntry, albumName string) error {
+	if sourceZip == "" {
+		_, err := s.db.Exec(
+			`INSERT INTO media_items (source_path, album_name)
+			      VALUES (?, ?)
+			      ON CONFLICT(source_path) DO NOTHING`,
+			sourcePath, nullStr(albumName),
+		)
+		return err
+	}
 	_, err := s.db.Exec(
-		`INSERT INTO media_items (source_path, source_zip, album_name)
-		      VALUES (?, ?, ?)
-		      ON CONFLICT(source_path) DO NOTHING`,
-		sourcePath, nullStr(sourceZip), nullStr(albumName),
+		`INSERT INTO media_items (source_path, source_zip, zip_entry, album_name)
+		      VALUES (?, ?, ?, ?)
+		      ON CONFLICT(source_zip, zip_entry) WHERE source_zip IS NOT NULL AND zip_entry IS NOT NULL
+		      DO UPDATE SET source_path = excluded.source_path`,
+		sourcePath, sourceZip, zipEntry, nullStr(albumName),
 	)
 	return err
 }
 
-// IsDone reports whether the given source path needs no further upload
-// attempts: it is complete, or permanently too large for the API.
-func (s *Store) IsDone(sourcePath string) (bool, error) {
+// IsDone reports whether a media file needs no further upload attempts: it
+// is complete, or permanently too large for the API. Zip-mode files are
+// looked up by (sourceZip, zipEntry), directory-mode files by sourcePath.
+func (s *Store) IsDone(sourceZip, zipEntry, sourcePath string) (bool, error) {
 	var status string
-	err := s.db.QueryRow(
-		`SELECT status FROM media_items WHERE source_path = ?`, sourcePath,
-	).Scan(&status)
+	var err error
+	if sourceZip != "" {
+		err = s.db.QueryRow(
+			`SELECT status FROM media_items WHERE source_zip = ? AND zip_entry = ?`,
+			sourceZip, zipEntry,
+		).Scan(&status)
+	} else {
+		err = s.db.QueryRow(
+			`SELECT status FROM media_items WHERE source_path = ?`, sourcePath,
+		).Scan(&status)
+	}
 	if err == sql.ErrNoRows {
 		return false, nil
 	}
@@ -233,6 +258,7 @@ func (s *Store) GetPendingMedia() ([]MediaItem, error) {
 type LargeFileItem struct {
 	SourcePath string
 	SourceZip  string // empty in dir mode
+	ZipEntry   string // path inside SourceZip; empty in dir mode
 	AlbumName  string
 	ErrorMsg   string
 }
@@ -244,6 +270,7 @@ func (s *Store) GetLargeFileErrors() ([]LargeFileItem, error) {
 	rows, err := s.db.Query(`
 		SELECT source_path,
 		       COALESCE(source_zip, ''),
+		       COALESCE(zip_entry, ''),
 		       COALESCE(album_name, ''),
 		       COALESCE(error_message, '')
 		  FROM media_items
@@ -263,7 +290,7 @@ func (s *Store) GetLargeFileErrors() ([]LargeFileItem, error) {
 	var items []LargeFileItem
 	for rows.Next() {
 		var it LargeFileItem
-		if err := rows.Scan(&it.SourcePath, &it.SourceZip, &it.AlbumName, &it.ErrorMsg); err != nil {
+		if err := rows.Scan(&it.SourcePath, &it.SourceZip, &it.ZipEntry, &it.AlbumName, &it.ErrorMsg); err != nil {
 			return nil, err
 		}
 		items = append(items, it)

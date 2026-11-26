@@ -282,7 +282,7 @@ func TestLargeFiles_ExpandsTildeInDBPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	bigFile := "/staging/takeout-001/Takeout/Google Photos/Trip/big.mp4"
-	if err := st.RegisterMedia(bigFile, "", "Trip"); err != nil {
+	if err := st.RegisterMedia(bigFile, "", "", "Trip"); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.SetMediaError(bigFile, "byte upload HTTP 413: Request Entity Too Large"); err != nil {
@@ -702,5 +702,55 @@ func TestProcessZips_TooLargeFileIsNotRetried(t *testing.T) {
 	}
 	if len(large) != 1 || filepath.Base(large[0].SourcePath) != "big.3gp" {
 		t.Errorf("large-files report = %+v, want just big.3gp", large)
+	}
+}
+
+// Break caught: files identified by their staging path, so changing
+// staging-dir between runs (as happened going from ./_staging to an absolute
+// path) makes every already-uploaded file look new and uploads it again.
+func TestProcessZips_StagingDirChangeDoesNotReupload(t *testing.T) {
+	var uploads atomic.Int32
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/uploads"):
+			uploads.Add(1)
+			_, _ = io.WriteString(w, "upload-token")
+		case strings.HasSuffix(r.URL.Path, "/mediaItems:batchCreate"):
+			_, _ = io.WriteString(w, `{"newMediaItemResults":[{"uploadToken":"upload-token","status":{},"mediaItem":{"id":"media-1"}}]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer fake.Close()
+	target, _ := url.Parse(fake.URL)
+	client := photos.New(&http.Client{Transport: rewriteTransport{target}})
+
+	zipPath := writeTakeoutZip(t, t.TempDir(), "takeout-001.zip")
+	st, err := store.Open(filepath.Join(t.TempDir(), "m.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	if err := st.RegisterZip(zipPath); err != nil {
+		t.Fatal(err)
+	}
+	logger := zap.NewNop()
+	pool := pipeline.NewPool(pipeline.Config{Workers: 1, RateLimit: 1000, Logger: logger}, client, st)
+
+	for _, staging := range []string{t.TempDir(), t.TempDir()} { // two different staging dirs
+		if err := processZips(context.Background(), []string{zipPath}, staging, st, pool, logger); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if n := uploads.Load(); n != 1 {
+		t.Errorf("file uploaded %d times after a staging-dir change, want 1", n)
+	}
+	stats, err := st.GetStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.TotalMedia != 1 || stats.CompleteMedia != 1 {
+		t.Errorf("media rows: total=%d complete=%d, want 1 and 1", stats.TotalMedia, stats.CompleteMedia)
 	}
 }
