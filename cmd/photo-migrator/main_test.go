@@ -622,3 +622,85 @@ func TestProcessZips_StopsOnRejectedSignIn(t *testing.T) {
 		}
 	}
 }
+
+// Break caught: a file Google rejects as too large (HTTP 413) being
+// re-uploaded on every run (minutes each for a >200 MB file) and keeping its
+// zip from ever completing.
+func TestProcessZips_TooLargeFileIsNotRetried(t *testing.T) {
+	var bigAttempts atomic.Int32
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/uploads"):
+			body, _ := io.ReadAll(r.Body)
+			if string(body) == "TOO-BIG" {
+				bigAttempts.Add(1)
+				w.WriteHeader(http.StatusRequestEntityTooLarge)
+				_, _ = io.WriteString(w, `{"code": 3, "message": "Uploaded photo must not have more than 209715200 bytes."}`)
+				return
+			}
+			_, _ = io.WriteString(w, "upload-token")
+		case strings.HasSuffix(r.URL.Path, "/mediaItems:batchCreate"):
+			_, _ = io.WriteString(w, `{"newMediaItemResults":[{"uploadToken":"upload-token","status":{},"mediaItem":{"id":"media-1"}}]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer fake.Close()
+	target, _ := url.Parse(fake.URL)
+	client := photos.New(&http.Client{Transport: rewriteTransport{target}})
+
+	zipPath := filepath.Join(t.TempDir(), "takeout-001.zip")
+	f, err := os.Create(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(f)
+	for name, content := range map[string]string{"small.jpg": "ok", "big.3gp": "TOO-BIG"} {
+		w, _ := zw.Create("Takeout/Google Photos/Photos from 2011/" + name)
+		_, _ = w.Write([]byte(content))
+	}
+	_ = zw.Close()
+	_ = f.Close()
+
+	dbPath := filepath.Join(t.TempDir(), "m.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	if err := st.RegisterZip(zipPath); err != nil {
+		t.Fatal(err)
+	}
+	logger := zap.NewNop()
+	pool := pipeline.NewPool(pipeline.Config{Workers: 2, RateLimit: 1000, Logger: logger}, client, st)
+	staging := t.TempDir()
+
+	for run := 1; run <= 2; run++ {
+		if err := processZips(context.Background(), []string{zipPath}, staging, st, pool, logger); err != nil {
+			t.Fatalf("run %d: %v", run, err)
+		}
+	}
+
+	if n := bigAttempts.Load(); n != 1 {
+		t.Errorf("too-large file uploaded %d times across 2 runs, want 1", n)
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	var zipStatus string
+	if err := db.QueryRow(`SELECT status FROM zip_archives`).Scan(&zipStatus); err != nil {
+		t.Fatal(err)
+	}
+	if zipStatus != "complete" {
+		t.Errorf("zip status = %q, want \"complete\" (too-large files are reported, not retried)", zipStatus)
+	}
+	large, err := st.GetLargeFileErrors()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(large) != 1 || filepath.Base(large[0].SourcePath) != "big.3gp" {
+		t.Errorf("large-files report = %+v, want just big.3gp", large)
+	}
+}

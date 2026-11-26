@@ -160,6 +160,11 @@ func (p *Pool) process(ctx context.Context, job Job, stop func(error)) {
 			stop(err) // not this file's fault: leave pending, stop the run
 			return
 		}
+		if errors.Is(err, photos.ErrTooLarge) {
+			log.Warn("too large for the Google Photos API; will not retry (see `photo-migrator large-files`)")
+			_ = p.store.SetMediaTooLarge(job.MediaPath, err.Error())
+			return
+		}
 		log.Error("upload failed", zap.Error(err))
 		_ = p.store.SetMediaError(job.MediaPath, err.Error())
 		return

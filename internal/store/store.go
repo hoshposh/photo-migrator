@@ -29,6 +29,9 @@ const (
 	StatusBytesUploaded Status = "bytes_uploaded"
 	StatusComplete      Status = "complete"
 	StatusError         Status = "error"
+	// StatusTooLarge marks a file Google rejected as too large for the API
+	// (HTTP 413). It is never retried; `large-files` lists it for manual upload.
+	StatusTooLarge Status = "too_large"
 )
 
 // Store wraps the SQLite database.
@@ -114,12 +117,12 @@ func (s *Store) SetZipStatus(zipPath string, status Status, errMsg string) error
 	return err
 }
 
-// AllZipItemsComplete returns true when every media_item for the given zip has
-// status = 'complete'.
+// AllZipItemsComplete returns true when every media_item for the given zip is
+// done: complete, or too large for the API (reported by `large-files`).
 func (s *Store) AllZipItemsComplete(zipPath string) (bool, error) {
 	var pending int
 	err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM media_items WHERE source_zip = ? AND status != 'complete'`,
+		`SELECT COUNT(*) FROM media_items WHERE source_zip = ? AND status NOT IN ('complete', 'too_large')`,
 		zipPath,
 	).Scan(&pending)
 	return pending == 0, err
@@ -149,8 +152,9 @@ func (s *Store) RegisterMedia(sourcePath, sourceZip, albumName string) error {
 	return err
 }
 
-// IsUploaded returns true if the given source path is already complete.
-func (s *Store) IsUploaded(sourcePath string) (bool, error) {
+// IsDone reports whether the given source path needs no further upload
+// attempts: it is complete, or permanently too large for the API.
+func (s *Store) IsDone(sourcePath string) (bool, error) {
 	var status string
 	err := s.db.QueryRow(
 		`SELECT status FROM media_items WHERE source_path = ?`, sourcePath,
@@ -161,7 +165,7 @@ func (s *Store) IsUploaded(sourcePath string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return Status(status) == StatusComplete, nil
+	return Status(status) == StatusComplete || Status(status) == StatusTooLarge, nil
 }
 
 // SetMediaUploadToken records the upload token after the byte-upload step.
@@ -186,6 +190,18 @@ func (s *Store) SetMediaComplete(sourcePath, photosMediaID string) error {
 	return err
 }
 
+// SetMediaTooLarge records that Google rejected the file as too large; it
+// will not be retried.
+func (s *Store) SetMediaTooLarge(sourcePath, errMsg string) error {
+	_, err := s.db.Exec(
+		`UPDATE media_items
+		    SET status = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP
+		  WHERE source_path = ?`,
+		string(StatusTooLarge), errMsg, sourcePath,
+	)
+	return err
+}
+
 // SetMediaError records a terminal error for a media item.
 func (s *Store) SetMediaError(sourcePath, errMsg string) error {
 	_, err := s.db.Exec(
@@ -197,7 +213,7 @@ func (s *Store) SetMediaError(sourcePath, errMsg string) error {
 	return err
 }
 
-// GetPendingMedia returns all non-complete media items (used in dir mode).
+// GetPendingMedia returns all media items still to upload (used in dir mode).
 func (s *Store) GetPendingMedia() ([]MediaItem, error) {
 	return s.queryMedia(
 		`SELECT source_path,
@@ -206,7 +222,7 @@ func (s *Store) GetPendingMedia() ([]MediaItem, error) {
 		        COALESCE(upload_token, ''),
 		        status
 		   FROM media_items
-		  WHERE status != 'complete'
+		  WHERE status NOT IN ('complete', 'too_large')
 		  ORDER BY id ASC`,
 	)
 }
@@ -231,11 +247,12 @@ func (s *Store) GetLargeFileErrors() ([]LargeFileItem, error) {
 		       COALESCE(album_name, ''),
 		       COALESCE(error_message, '')
 		  FROM media_items
-		 WHERE status = 'error'
+		 WHERE status = 'too_large'
+		    OR (status = 'error'
 		   AND (error_message LIKE '%HTTP 413%'
 		     OR error_message LIKE '%too large%'
 		     OR error_message LIKE '%exceeds%'
-		     OR error_message LIKE '%FILE_SIZE_TOO_LARGE%')
+		     OR error_message LIKE '%FILE_SIZE_TOO_LARGE%'))
 		 ORDER BY source_zip ASC, source_path ASC`,
 	)
 	if err != nil {
@@ -324,6 +341,7 @@ type Stats struct {
 	CompleteMedia  int
 	PendingMedia   int
 	ErrorMedia     int
+	TooLargeMedia  int
 	TotalAlbums    int
 	CompleteAlbums int
 }
@@ -344,9 +362,10 @@ func (s *Store) GetStats() (*Stats, error) {
 		SELECT COUNT(*),
 		       COALESCE(SUM(CASE WHEN status='complete'                         THEN 1 ELSE 0 END), 0),
 		       COALESCE(SUM(CASE WHEN status IN ('pending','bytes_uploaded')    THEN 1 ELSE 0 END), 0),
-		       COALESCE(SUM(CASE WHEN status='error'                            THEN 1 ELSE 0 END), 0)
+		       COALESCE(SUM(CASE WHEN status='error'                            THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN status='too_large'                        THEN 1 ELSE 0 END), 0)
 		  FROM media_items`,
-	).Scan(&st.TotalMedia, &st.CompleteMedia, &st.PendingMedia, &st.ErrorMedia); err != nil {
+	).Scan(&st.TotalMedia, &st.CompleteMedia, &st.PendingMedia, &st.ErrorMedia, &st.TooLargeMedia); err != nil {
 		return nil, fmt.Errorf("stats media_items: %w", err)
 	}
 

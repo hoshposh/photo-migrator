@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +13,10 @@ import (
 	"strconv"
 	"strings"
 )
+
+// ErrTooLarge reports that Google rejected a file as too large for the API
+// (HTTP 413). Retrying cannot help; the file must be uploaded manually.
+var ErrTooLarge = errors.New("file too large for the Google Photos API")
 
 // UploadBytes streams the raw bytes of mediaPath to the Google Photos upload
 // endpoint and returns an opaque uploadToken.
@@ -52,6 +57,9 @@ func (c *Client) UploadBytes(ctx context.Context, mediaPath string) (_ string, e
 	defer func() { _ = resp.Body.Close() }()
 
 	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusRequestEntityTooLarge {
+		return "", fmt.Errorf("%w: byte upload HTTP 413: %s", ErrTooLarge, body)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("byte upload HTTP %d: %s", resp.StatusCode, body)
 	}

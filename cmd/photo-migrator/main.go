@@ -428,6 +428,9 @@ func newStatusCmd() *cobra.Command {
 			fmt.Printf("       ✓ complete    %d\n", stats.CompleteMedia)
 			fmt.Printf("       ⏳ pending    %d\n", stats.PendingMedia)
 			fmt.Printf("       ✗ errors     %d\n", stats.ErrorMedia)
+			if stats.TooLargeMedia > 0 {
+				fmt.Printf("       ⚠ too large  %d  (upload manually: see 'photo-migrator large-files')\n", stats.TooLargeMedia)
+			}
 			fmt.Printf("  🗂   Albums         %d / %d created\n", stats.CompleteAlbums, stats.TotalAlbums)
 
 			if stats.TotalZips > 0 {
@@ -974,7 +977,7 @@ func processDirectory(ctx context.Context, dir, sourceZip string, st *store.Stor
 
 	go func() {
 		defer close(jobs)
-		err := takeout.WalkDirectory(walkCtx, dir, sourceZip, st.IsUploaded, func(j takeout.MigrationJob) {
+		err := takeout.WalkDirectory(walkCtx, dir, sourceZip, st.IsDone, func(j takeout.MigrationJob) {
 			// Register in DB before handing off to the worker pool. Skipped on
 			// dry runs: rows are keyed by (staging) path, and rows a real run
 			// never revisits would keep their zip incomplete forever.

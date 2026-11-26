@@ -165,8 +165,8 @@ func (c *ctxReader) Read(p []byte) (int, error) {
 // media file that has not already been uploaded. It stops and returns
 // ctx.Err() as soon as ctx is cancelled.
 //
-// isUploaded is called for every media file found; if it returns true the file
-// is silently skipped (idempotency).
+// isDone is called for every media file found; if it returns true the file
+// needs no upload (already uploaded, or permanently too large) and is skipped.
 //
 // emit is the callback that receives each MigrationJob. Typically the caller
 // uses a closure that registers the item in the store and forwards it to a
@@ -174,7 +174,7 @@ func (c *ctxReader) Read(p []byte) (int, error) {
 func WalkDirectory(
 	ctx context.Context,
 	dir, sourceZip string,
-	isUploaded func(string) (bool, error),
+	isDone func(string) (bool, error),
 	emit func(MigrationJob),
 	logger *zap.Logger,
 ) error {
@@ -190,11 +190,11 @@ func WalkDirectory(
 			return nil
 		}
 
-		uploaded, err := isUploaded(path)
+		done, err := isDone(path)
 		if err != nil {
 			return fmt.Errorf("check uploaded %s: %w", path, err)
 		}
-		if uploaded {
+		if done {
 			return nil
 		}
 

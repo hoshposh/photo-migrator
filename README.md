@@ -241,8 +241,10 @@ With `restore-metadata` enabled, exiftool edits files in place. In zip mode thes
 ## Handling oversized files
 
 The Google Photos API rejects files larger than **~200 MB** with an HTTP 413
-error. These files are recorded in the database with `status='error'` and must
-be uploaded manually through the [Google Photos web UI](https://photos.google.com/).
+error. These files are recorded in the database with `status='too_large'`: they
+are **not retried** on later runs, they don't stop their zip from completing,
+and `status` lists them separately. They must be uploaded manually through the
+[Google Photos web UI](https://photos.google.com/).
 
 Use the `large-files` command to generate a report of every affected file:
 
@@ -380,5 +382,5 @@ The tool also applies exponential backoff (up to 60 s) on 429 and 5xx responses 
 | `authorization timed out` | Re-run `auth`; complete the browser flow within 3 minutes |
 | `batchCreate item error: The caller does not have permission` | Your Google Cloud project may need Photos Library API access approval; check the OAuth consent screen and ensure Account B is listed as a test user |
 | `byte upload: open media file: no such file or directory` | The staging directory was cleaned up; re-run `run` to re-extract and retry |
-| `byte upload HTTP 413` | The file exceeds the ~200 MB API limit; run `photo-migrator large-files --extract <dir>` and upload manually via [photos.google.com](https://photos.google.com/) |
+| `too large for the Google Photos API` / `HTTP 413` | The file exceeds the ~200 MB API limit and won't be retried; run `photo-migrator large-files --extract <dir>` and upload manually via [photos.google.com](https://photos.google.com/) |
 | `google rejected the saved sign-in` / `invalid_grant` | Your saved sign-in has expired or been revoked (apps in Testing mode expire after 7 days). The run stops at the first such error and leaves the remaining files pending. Run `photo-migrator auth` to sign in again, then re-run `run`. |
