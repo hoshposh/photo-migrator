@@ -202,3 +202,21 @@ func TestBatchGet_RetriesAfterTimeout(t *testing.T) {
 		t.Errorf("%d requests, want 2", n)
 	}
 }
+
+// Break caught: the photo's link being dropped from the batchGet answer, so
+// the report cannot link to it.
+func TestBatchGet_ProductURL(t *testing.T) {
+	c, _ := batchGetClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"mediaItemResults":[` +
+			`{"mediaItem":{"id":"a","productUrl":"https://photos.google.com/lr/photo/AAA","mediaMetadata":{"creationTime":"2019-06-14T18:02:00Z"}}},` +
+			`{"mediaItem":{"id":"b","mediaMetadata":{"creationTime":"2019-06-14T18:02:00Z"}}},` +
+			`{"status":{"code":5,"message":"Not found"}}]}`))
+	})
+	got, err := c.BatchGet(context.Background(), []string{"a", "b", "c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].ProductURL != "https://photos.google.com/lr/photo/AAA" || got[1].ProductURL != "" || got[2].ProductURL != "" {
+		t.Errorf("ProductURLs = %q, %q, %q", got[0].ProductURL, got[1].ProductURL, got[2].ProductURL)
+	}
+}

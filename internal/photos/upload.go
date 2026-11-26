@@ -153,6 +153,8 @@ type BatchCreateResult struct {
 	StatusMsg   string
 	// CreationTime is mediaItem.mediaMetadata.creationTime; zero if absent.
 	CreationTime time.Time
+	// ProductURL is mediaItem.productUrl; "" if absent.
+	ProductURL string
 }
 
 type batchCreateResp struct {
@@ -164,6 +166,7 @@ type batchCreateResp struct {
 		} `json:"status"`
 		MediaItem struct {
 			ID            string        `json:"id"`
+			ProductURL    string        `json:"productUrl"`
 			MediaMetadata mediaMetadata `json:"mediaMetadata"`
 		} `json:"mediaItem"`
 	} `json:"newMediaItemResults"`
@@ -230,6 +233,7 @@ func (c *Client) BatchCreate(ctx context.Context, albumID string, items []NewIte
 			StatusMsg:   r.Status.Message,
 
 			CreationTime: parseCreationTime(r.MediaItem.MediaMetadata.CreationTime),
+			ProductURL:   r.MediaItem.ProductURL,
 		}
 		if r.Status.Code != 0 {
 			res.StatusMsg = r.Status.Message + " (code " + strconv.Itoa(r.Status.Code) + ")"

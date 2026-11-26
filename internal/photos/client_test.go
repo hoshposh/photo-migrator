@@ -269,3 +269,24 @@ func TestBatchCreate_ReturnsCreationTime(t *testing.T) {
 		t.Errorf("CreationTime without metadata = %v, want zero", res[1].CreationTime)
 	}
 }
+
+// Break caught: the link in the batchCreate answer being dropped, so a fresh
+// upload has no link until the report asks Google.
+func TestBatchCreate_ReturnsProductURL(t *testing.T) {
+	f := &fakeAPI{onBatch: func(w http.ResponseWriter) bool {
+		_, _ = io.WriteString(w, `{"newMediaItemResults":[`+
+			`{"uploadToken":"t1","status":{},"mediaItem":{"id":"m1","productUrl":"https://photos.google.com/lr/photo/M1"}},`+
+			`{"uploadToken":"t2","status":{},"mediaItem":{"id":"m2"}}]}`)
+		return true
+	}}
+	c := f.client(t)
+	res, err := c.BatchCreate(context.Background(), "", []NewItem{
+		{UploadToken: "t1", FileName: "a.jpg"}, {UploadToken: "t2", FileName: "b.jpg"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res[0].ProductURL != "https://photos.google.com/lr/photo/M1" || res[1].ProductURL != "" {
+		t.Errorf("ProductURLs = %q, %q", res[0].ProductURL, res[1].ProductURL)
+	}
+}

@@ -34,8 +34,12 @@ const (
 
 type wrongDatesOpts struct {
 	TakeoutDir string
-	Format     string // "text" | "json"
+	Format     string // "text" | "json" | "html"
 	Recheck    bool   // ask Google again about photos currently listed as wrong
+	// Location and Now are for the HTML page: the time zone dates are shown
+	// in, and the generated time. Nil / zero mean time.Local / time.Now().
+	Location *time.Location
+	Now      time.Time
 }
 
 // dateReport is the verdict on every uploaded photo, counted per media ID.
@@ -50,6 +54,7 @@ type wrongDate struct {
 	ShouldBe, GoogleHas                        time.Time
 	OtherExpected                              []time.Time // other rows' dates > 24 h from ShouldBe
 	Copies                                     []dateCopy  // every row for this media ID
+	URL                                        string      // opens the photo in Google Photos; "" = unknown
 }
 
 type dateCopy struct{ SourceZip, InZipPath, Album string }
@@ -150,12 +155,15 @@ func judgeDates(rows []store.DateRow) dateReport {
 		w := wrongDate{
 			MediaID: id, File: filepath.Base(shown.SourcePath), Album: shown.AlbumName,
 			SourceZip: shown.SourceZip, InZipPath: rowEntry(shown), SourcePath: shown.SourcePath,
-			ShouldBe: shown.TakenTime, GoogleHas: shown.GoogleTime,
+			ShouldBe: shown.TakenTime, GoogleHas: shown.GoogleTime, URL: shown.GoogleURL,
 		}
 		if w.InZipPath != "" {
 			w.File = filepath.Base(w.InZipPath)
 		}
 		for _, r := range g {
+			if w.URL == "" {
+				w.URL = r.GoogleURL
+			}
 			w.Copies = append(w.Copies, dateCopy{r.SourceZip, rowEntry(r), r.AlbumName})
 			if r.TakenSource == store.TakenFromSidecar && absDuration(r.TakenTime.Sub(w.ShouldBe)) > wrongDateThreshold {
 				w.OtherExpected = append(w.OtherExpected, r.TakenTime)
@@ -176,8 +184,8 @@ func judgeDates(rows []store.DateRow) dateReport {
 // newClient is called only if something must be fetched from Google.
 func runWrongDates(ctx context.Context, st *store.Store, newClient func() (*photos.Client, error),
 	opts wrongDatesOpts, out, errOut io.Writer, logger *zap.Logger) error {
-	if opts.Format != "text" && opts.Format != "json" {
-		return fmt.Errorf("--format must be text or json, got %q", opts.Format)
+	if opts.Format != "text" && opts.Format != "json" && opts.Format != "html" {
+		return fmt.Errorf("--format must be text, json or html, got %q", opts.Format)
 	}
 	rows, err := st.GetDateRows()
 	if err != nil {
@@ -186,22 +194,36 @@ func runWrongDates(ctx context.Context, st *store.Store, newClient func() (*phot
 	if err := fillTakenDates(ctx, st, rows, opts.TakeoutDir, logger); err != nil {
 		return err
 	}
-	// rows predates fillTakenDates; fine, as a photo whose date was found just now was never listed.
-	var recheck []string
-	if opts.Recheck {
-		for _, w := range judgeDates(rows).Wrong {
-			recheck = append(recheck, w.MediaID)
+	if rows, err = st.GetDateRows(); err != nil { // now with the dates just found
+		return fmt.Errorf("read uploaded files: %w", err)
+	}
+	// Photos listed as wrong are asked about again when --recheck is given,
+	// and when no row of theirs has a link yet, so one run fills the links.
+	var again []string
+	for _, w := range judgeDates(rows).Wrong {
+		if opts.Recheck || w.URL == "" {
+			again = append(again, w.MediaID)
 		}
 	}
-	if err := fillGoogleDates(ctx, st, rows, recheck, newClient, errOut, logger); err != nil {
+	if err := fillGoogleDates(ctx, st, rows, again, newClient, errOut, logger); err != nil {
 		return err
 	}
 	if rows, err = st.GetDateRows(); err != nil {
 		return fmt.Errorf("read uploaded files: %w", err)
 	}
 	rep := judgeDates(rows)
-	if opts.Format == "json" {
+	switch opts.Format {
+	case "json":
 		return printWrongDatesJSON(out, rep)
+	case "html":
+		loc, now := opts.Location, opts.Now
+		if loc == nil {
+			loc = time.Local
+		}
+		if now.IsZero() {
+			now = time.Now()
+		}
+		return printWrongDatesHTML(out, rep, loc, now)
 	}
 	printWrongDatesText(out, rep)
 	return nil
@@ -292,9 +314,9 @@ func zipTakenDates(ctx context.Context, all, zipRows []store.DateRow, takeoutDir
 }
 
 // fillGoogleDates asks Google for the date of every media ID not yet checked,
-// plus the IDs in recheck, saving each batch as it arrives so an interrupt
+// plus the IDs in also, saving each batch as it arrives so an interrupt
 // loses nothing.
-func fillGoogleDates(ctx context.Context, st *store.Store, rows []store.DateRow, recheck []string,
+func fillGoogleDates(ctx context.Context, st *store.Store, rows []store.DateRow, also []string,
 	newClient func() (*photos.Client, error), errOut io.Writer, logger *zap.Logger) error {
 	seen := map[string]bool{}
 	var ids []string
@@ -304,7 +326,7 @@ func fillGoogleDates(ctx context.Context, st *store.Store, rows []store.DateRow,
 			ids = append(ids, r.MediaID)
 		}
 	}
-	for _, id := range recheck {
+	for _, id := range also {
 		if !seen[id] {
 			seen[id] = true
 			ids = append(ids, id)
@@ -353,7 +375,7 @@ func fillGoogleDates(ctx context.Context, st *store.Store, rows []store.DateRow,
 				logger.Warn("Google returned a photo without a date; leaving it unchecked", zap.String("media_id", d.ID))
 				continue
 			}
-			got = append(got, store.GoogleDate{MediaID: d.ID, Time: d.CreationTime, Missing: d.Missing})
+			got = append(got, store.GoogleDate{MediaID: d.ID, Time: d.CreationTime, Missing: d.Missing, URL: d.ProductURL})
 		}
 		if err := st.SetGoogleDates(got, time.Now()); err != nil {
 			return fmt.Errorf("save Google dates: %w", err)
@@ -407,6 +429,15 @@ func printWrongDatesText(w io.Writer, rep dateReport) {
 		_, _ = fmt.Fprint(w, "\n  Fix each in Google Photos: open the photo → ⋮ → Edit date & time.\n  Dates are shown in UTC.\n  After fixing some, run: photo-migrator wrong-dates --recheck\n")
 	}
 
+	if n := notJudgedText(rep); n != "" {
+		_, _ = fmt.Fprintf(w, "  Not judged: %s.\n", n)
+	}
+	_, _ = fmt.Fprintln(w)
+}
+
+// notJudgedText is the counts of photos that were not judged, for example
+// "2 without a sidecar date, 1 not checked yet"; "" when there are none.
+func notJudgedText(rep dateReport) string {
 	var parts []string
 	for _, p := range []struct {
 		n    int
@@ -420,10 +451,7 @@ func printWrongDatesText(w io.Writer, rep dateReport) {
 			parts = append(parts, fmt.Sprintf("%d %s", p.n, p.what))
 		}
 	}
-	if len(parts) > 0 {
-		_, _ = fmt.Fprintf(w, "  Not judged: %s.\n", strings.Join(parts, ", "))
-	}
-	_, _ = fmt.Fprintln(w)
+	return strings.Join(parts, ", ")
 }
 
 // copyLabel is "zip / path" for a zip row, the file's path in directory mode.
@@ -442,6 +470,7 @@ type wrongDateJSON struct {
 	InZipPath     string     `json:"in_zip_path"`
 	ShouldBe      string     `json:"should_be"`
 	GoogleHas     string     `json:"google_has"`
+	URL           string     `json:"url"`
 	OtherExpected []string   `json:"other_expected"`
 	Copies        []copyJSON `json:"copies"`
 }
@@ -467,7 +496,7 @@ func printWrongDatesJSON(w io.Writer, rep dateReport) error {
 	for _, d := range rep.Wrong {
 		j := wrongDateJSON{
 			MediaID: d.MediaID, File: d.File, Album: d.Album, SourceZip: d.SourceZip, InZipPath: d.InZipPath,
-			ShouldBe: rfc(d.ShouldBe), GoogleHas: rfc(d.GoogleHas),
+			ShouldBe: rfc(d.ShouldBe), GoogleHas: rfc(d.GoogleHas), URL: d.URL,
 			OtherExpected: []string{}, Copies: []copyJSON{},
 		}
 		for _, t := range d.OtherExpected {
@@ -509,6 +538,12 @@ can only be fixed by hand: open the photo in Google Photos, choose
 ⋮ → Edit date & time. Afterwards, --recheck asks Google again about the
 photos currently listed, so the ones you fixed drop off the list.
 
+Every listed photo comes with a link that opens it in Google Photos (the text
+table does not show it; use --format json or --format html). --format html
+writes a self-contained checklist page (wrong-dates --format html >
+wrong-dates.html): one row per photo with the date to set in this computer's
+time zone, the link and a checkbox. Ticks are remembered in the browser.
+
 Photos not judged are counted at the end: those whose sidecar has no date,
 those Google does not let this tool read (already in your library before
 this tool, or deleted), and those not checked yet (for example a zip missing
@@ -517,7 +552,8 @@ from --takeout-dir).
 Flags:
   --takeout-dir <dir>  where the Takeout zips are (or set takeout-dir in the config)
   --recheck            ask Google again about the photos listed as wrong
-  --format json        Emit machine-readable JSON instead of a text table`,
+  --format json        Emit machine-readable JSON instead of a text table
+  --format html        Emit a checklist web page with a link to each photo`,
 		RunE: func(cmd *cobra.Command, args []string) (err error) {
 			st, err := store.Open(viperPath("db-path"))
 			if err != nil {
@@ -536,7 +572,8 @@ Flags:
 
 			return runWrongDates(ctx, st, func() (*photos.Client, error) {
 				return buildPhotosClient(viperPath("credentials"), viper.GetFloat64("rate-limit"))
-			}, wrongDatesOpts{TakeoutDir: viperPath("takeout-dir"), Format: format, Recheck: recheck},
+			}, wrongDatesOpts{TakeoutDir: viperPath("takeout-dir"), Format: format, Recheck: recheck,
+				Location: time.Local, Now: time.Now()},
 				os.Stdout, os.Stderr, buildLogger())
 		},
 	}
@@ -544,7 +581,7 @@ Flags:
 	f.String("takeout-dir", "", "directory with the Takeout .zip files (to read sidecars)")
 	f.String("credentials", defaultCredentials, "path to OAuth2 credentials.json from Google Cloud Console")
 	f.Float64("rate-limit", defaultRateLimit, "max Google Photos API requests per second")
-	f.StringVar(&format, "format", "text", "output format: text | json")
+	f.StringVar(&format, "format", "text", "output format: text | json | html")
 	f.BoolVar(&recheck, "recheck", false, "ask Google again about the photos currently listed as wrong")
 	return cmd
 }

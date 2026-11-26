@@ -22,6 +22,7 @@ type ItemDate struct {
 	CreationTime time.Time // mediaMetadata.creationTime; zero when Missing
 	Missing      bool      // Google returned a status instead of the item
 	Status       string    // that status message, for logging
+	ProductURL   string    // mediaItem.productUrl: opens the photo in Google Photos; "" when absent
 }
 
 // google.rpc.Code values that mean a media item is gone or unreadable.
@@ -42,6 +43,7 @@ type mediaMetadata struct {
 type batchGetResp struct {
 	MediaItemResults []struct {
 		MediaItem *struct {
+			ProductURL    string        `json:"productUrl"`
 			MediaMetadata mediaMetadata `json:"mediaMetadata"`
 		} `json:"mediaItem"`
 		Status *struct {
@@ -107,6 +109,7 @@ func (c *Client) BatchGet(ctx context.Context, ids []string) ([]ItemDate, error)
 		r := parsed.MediaItemResults[i]
 		if r.MediaItem != nil {
 			d.CreationTime = parseCreationTime(r.MediaItem.MediaMetadata.CreationTime)
+			d.ProductURL = r.MediaItem.ProductURL
 			dates[i] = d
 			continue
 		}

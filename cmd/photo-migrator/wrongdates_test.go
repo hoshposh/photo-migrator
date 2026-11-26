@@ -32,6 +32,9 @@ var (
 	wdGoogle = time.Date(2026, 7, 3, 9, 41, 0, 0, time.UTC)
 )
 
+// wdURL is the productUrl the fake Google gives a media ID.
+func wdURL(id string) string { return "https://photos.google.com/lr/photo/" + id }
+
 func wdSidecar(title string, taken time.Time) string {
 	return fmt.Sprintf(`{"title":%q,"photoTakenTime":{"timestamp":"%d"}}`, title, taken.Unix())
 }
@@ -176,6 +179,7 @@ type wdFixture struct {
 	dbPath  string
 	google  map[string]time.Time
 	missing map[string]bool
+	noURL   map[string]bool // IDs Google answers without a productUrl
 
 	mu       sync.Mutex
 	requests [][]string // IDs of each batchGet, in order
@@ -187,7 +191,7 @@ type wdFixture struct {
 
 func newWDFixture(t *testing.T) *wdFixture {
 	t.Helper()
-	f := &wdFixture{t: t, dir: t.TempDir(), google: map[string]time.Time{}, missing: map[string]bool{}}
+	f := &wdFixture{t: t, dir: t.TempDir(), google: map[string]time.Time{}, missing: map[string]bool{}, noURL: map[string]bool{}}
 	f.dbPath = filepath.Join(t.TempDir(), "m.db")
 	st, err := store.Open(f.dbPath)
 	if err != nil {
@@ -232,10 +236,14 @@ func (f *wdFixture) serve(w http.ResponseWriter, r *http.Request) {
 			out.MediaItemResults = append(out.MediaItemResults, result{Status: map[string]any{"code": 5, "message": "not found"}})
 			continue
 		}
-		out.MediaItemResults = append(out.MediaItemResults, result{MediaItem: map[string]any{
+		item := map[string]any{
 			"id":            id,
 			"mediaMetadata": map[string]any{"creationTime": f.google[id].Format(time.RFC3339)},
-		}})
+		}
+		if !f.noURL[id] {
+			item["productUrl"] = wdURL(id)
+		}
+		out.MediaItemResults = append(out.MediaItemResults, result{MediaItem: item})
 	}
 	_ = json.NewEncoder(w).Encode(out)
 }
@@ -906,6 +914,131 @@ func TestWrongDatesCmd_HelpWrap(t *testing.T) {
 	for _, line := range strings.Split(newWrongDatesCmd().Long, "\n") {
 		if strings.HasSuffix(strings.TrimSpace(line), " and") {
 			t.Errorf("help line ends with a dangling 'and': %q", line)
+		}
+	}
+}
+
+// Break caught: a photo whose date is stored but whose link is not being
+// listed without a link for ever, or the report asking Google about photos it
+// already has a link for.
+func TestWrongDates_FetchesMissingURLs(t *testing.T) {
+	f := newWDFixture(t)
+	f.addZip("takeout-001.zip", map[string]string{
+		wdTrip + "a.jpg.supplemental-metadata.json": wdSidecar("a.jpg", wdTaken),
+		wdTrip + "b.jpg.supplemental-metadata.json": wdSidecar("b.jpg", wdTaken),
+	})
+	f.upload("takeout-001.zip", wdTrip+"a.jpg", "Trip", "m-a")
+	f.upload("takeout-001.zip", wdTrip+"b.jpg", "Trip", "m-b")
+	f.google["m-a"], f.google["m-b"] = wdGoogle, wdGoogle
+	f.noURL["m-a"] = true // as if the date came from a run before links existed
+
+	if _, _, err := f.run(context.Background(), wrongDatesOpts{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	n := f.requestCount()
+	delete(f.noURL, "m-a")
+
+	out, _, err := f.run(context.Background(), wrongDatesOpts{Format: "json"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.requestCount() != n+1 {
+		t.Fatalf("made %d requests, want 1", f.requestCount()-n)
+	}
+	if got := f.requests[n]; !reflect.DeepEqual(got, []string{"m-a"}) {
+		t.Errorf("asked for %v, want only m-a (m-b already has a link)", got)
+	}
+	var got struct {
+		Wrong []struct {
+			MediaID string `json:"media_id"`
+			URL     string `json:"url"`
+		} `json:"wrong"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, out)
+	}
+	if len(got.Wrong) != 2 || got.Wrong[0].URL != wdURL("m-a") || got.Wrong[1].URL != wdURL("m-b") {
+		t.Errorf("wrong = %+v, want both with their url", got.Wrong)
+	}
+}
+
+// Break caught: the HTML page missing the link or the "no link" note, not
+// escaping a hostile file name, showing the date in UTC instead of the local
+// zone, losing the id the ticks are saved under, or loading anything from the
+// network.
+func TestWrongDates_HTML(t *testing.T) {
+	f := newWDFixture(t)
+	const hostile = `<b>&"x".jpg`
+	taken := time.Date(2018, 7, 29, 18, 17, 0, 0, time.UTC)
+	f.addZip("takeout-001.zip", map[string]string{
+		wdTrip + hostile + ".supplemental-metadata.json": wdSidecar(hostile, taken),
+		wdTrip + "b.jpg.supplemental-metadata.json":      wdSidecar("b.jpg", taken),
+	})
+	f.upload("takeout-001.zip", wdTrip+hostile, "Trip", "m-a")
+	f.upload("takeout-001.zip", wdTrip+"b.jpg", "Trip", "m-b")
+	f.google["m-a"], f.google["m-b"] = wdGoogle, wdGoogle
+	f.noURL["m-b"] = true
+
+	out, _, err := f.run(context.Background(), wrongDatesOpts{
+		Format: "html", Location: time.FixedZone("", -4*3600), Now: time.Date(2026, 11, 26, 9, 0, 0, 0, time.UTC),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`href="` + wdURL("m-a") + `"`, `target="_blank"`, `rel="noopener"`,
+		"no link",
+		`&lt;b&gt;&amp;`,
+		"29 Jul 2018, 2:17 PM (GMT-04:00)", "2018-07-29 18:17 UTC",
+		`data-id="m-a"`, `data-id="m-b"`,
+		"photo-migrator-wrong-dates",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("page missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, `<b>&"x"`) {
+		t.Errorf("file name not escaped:\n%s", out)
+	}
+	for _, bad := range []string{"<script src", "<link", "@import", "url(http"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("page loads from outside: contains %q", bad)
+		}
+	}
+	rest := strings.ReplaceAll(out, wdURL("m-a"), "")
+	if strings.Contains(rest, "http") {
+		i := strings.Index(rest, "http")
+		t.Errorf("page contains a URL other than the productUrl links: %q", rest[max(0, i-40):min(len(rest), i+60)])
+	}
+}
+
+// Break caught: an empty list producing a table with no rows instead of the
+// "nothing wrong" message.
+func TestPrintWrongDatesHTML_NothingWrong(t *testing.T) {
+	var b bytes.Buffer
+	if err := printWrongDatesHTML(&b, dateReport{NotReadable: 3}, time.UTC, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	out := b.String()
+	if !strings.Contains(out, "No uploaded photos have a wrong date.") || strings.Contains(out, "<input") {
+		t.Errorf("unexpected page:\n%s", out)
+	}
+	if !strings.Contains(out, "3 already in your library before this tool, or deleted") {
+		t.Errorf("not-judged counts missing:\n%s", out)
+	}
+}
+
+// Break caught: --format xml being accepted, or the error naming only some of
+// the formats.
+func TestWrongDates_FormatRejected(t *testing.T) {
+	f := newWDFixture(t)
+	_, _, err := f.run(context.Background(), wrongDatesOpts{Format: "xml"}, nil)
+	if err == nil {
+		t.Fatal("format xml accepted")
+	}
+	for _, want := range []string{"text", "json", "html", "xml"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q lacks %q", err, want)
 		}
 	}
 }

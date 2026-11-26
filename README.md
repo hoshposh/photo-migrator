@@ -319,6 +319,9 @@ photo's date after upload, so these can only be fixed by hand, but the
 # Machine-readable JSON
 ./photo-migrator wrong-dates --takeout-dir /path/to/takeout-zips/ --format json
 
+# A checklist web page with a link to each photo (open wrong-dates.html in a browser)
+./photo-migrator wrong-dates --takeout-dir /path/to/takeout-zips/ --format html > wrong-dates.html
+
 # After fixing some dates by hand: ask Google again about the listed photos
 ./photo-migrator wrong-dates --recheck
 ```
@@ -347,7 +350,20 @@ the existing photo (with its own date) and this tool cannot read it, so such
 photos are counted as "already in your library before this tool, or deleted"
 and not judged.
 
-To fix a photo, find it in Google Photos, open it, and choose
+Google Photos' search cannot find a photo by its exact file name, so each
+listed photo comes with the link Google gives it (`productUrl`), which opens
+that exact photo. The links are in `--format json` (the `url` field) and in the
+HTML page; the text table does not show them. The command fetches any missing
+links from Google in the same run. `--format html` writes one self-contained
+page, with no network use except those links: one row per photo with a
+checkbox, the file name and album, the date to set in this computer's time
+zone (with its offset) and in UTC, Google's current date, and an **Open in
+Google Photos** link. Ticks are remembered in the browser's local storage (per
+page location), so you can work through the list over several sittings; a
+counter shows how many are done. Regenerate the page with
+`wrong-dates --recheck --format html > wrong-dates.html` after fixing some.
+
+To fix a photo, open it from its link (or find it in Google Photos) and choose
 **⋮ → Edit date & time**. Then run `wrong-dates --recheck`: it asks Google
 again about the photos that were listed (and only those, plus any not yet
 checked), so the ones you fixed drop off the list.
@@ -456,6 +472,7 @@ photo-migrator large-files --format json       # machine-readable JSON report
 photo-migrator large-files --extract <dir>     # re-extract oversized files for manual upload
 photo-migrator wrong-dates --takeout-dir <dir> # list uploaded photos whose Google date is not the date taken
 photo-migrator wrong-dates --recheck           # ask Google again about the listed photos
+photo-migrator wrong-dates --format html       # a checklist web page with a link to each photo
 photo-migrator locked-files                    # list Locked Folder files held back from upload
 photo-migrator locked-files --extract <dir>    # extract them to handle by hand
 photo-migrator motion-videos                   # list motion-photo video parts held back from upload

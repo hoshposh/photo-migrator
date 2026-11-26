@@ -251,3 +251,75 @@ func TestMigration00007_MediaIDIndex(t *testing.T) {
 		t.Errorf("GetDateRows = %+v, want the one row", rows)
 	}
 }
+
+// Break caught: a photo's link being stored on only one of the rows that share
+// its media ID, or a later date update or "missing" answer (which carries no
+// link) erasing a link that is still good.
+func TestSetGoogleDates_URL(t *testing.T) {
+	st := openTestStore(t)
+	mustExec(t, st, `INSERT INTO media_items (source_path, status, photos_media_id) VALUES
+		('a', 'complete', 'm-1'), ('b', 'complete', 'm-1'), ('c', 'complete', 'm-2')`)
+	g := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
+	now := time.Date(2026, 11, 26, 10, 0, 0, 0, time.UTC)
+	const link = "https://photos.google.com/lr/photo/abc"
+
+	if err := st.SetGoogleDates([]GoogleDate{{MediaID: "m-1", Time: g, URL: link}}, now); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"a", "b"} {
+		if r := dateRowByPath(t, st, p); r.GoogleURL != link {
+			t.Errorf("%s GoogleURL = %q, want %q", p, r.GoogleURL, link)
+		}
+	}
+	if r := dateRowByPath(t, st, "c"); r.GoogleURL != "" {
+		t.Errorf("c was touched: %q", r.GoogleURL)
+	}
+
+	if err := st.SetGoogleDates([]GoogleDate{{MediaID: "m-1", Time: g.Add(time.Hour)}}, now); err != nil {
+		t.Fatal(err)
+	}
+	if r := dateRowByPath(t, st, "a"); r.GoogleURL != link || !r.GoogleTime.Equal(g.Add(time.Hour)) {
+		t.Errorf("date update without URL: %+v, want link kept and date updated", r)
+	}
+	if err := st.SetGoogleDates([]GoogleDate{{MediaID: "m-1", Missing: true}}, now); err != nil {
+		t.Fatal(err)
+	}
+	if r := dateRowByPath(t, st, "b"); r.GoogleURL != link || !r.GoogleMissing {
+		t.Errorf("missing answer: %+v, want link kept", r)
+	}
+}
+
+// Break caught: the google_url migration failing on a ledger that already
+// holds uploaded files, or leaving existing rows with a made-up link.
+func TestMigration00008_GoogleURL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "m.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	goose.SetBaseFS(embedMigrations)
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		t.Fatal(err)
+	}
+	goose.SetLogger(goose.NopLogger())
+	if err := goose.UpTo(db, "migrations", 7); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO media_items (source_path, status, photos_media_id) VALUES ('/s/a.jpg', 'complete', 'm-1')`); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open (applies later migrations): %v", err)
+	}
+	defer func() { _ = st.Close() }()
+	rows, err := st.GetDateRows()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].MediaID != "m-1" || rows[0].GoogleURL != "" {
+		t.Errorf("GetDateRows = %+v, want the one row with no URL", rows)
+	}
+}

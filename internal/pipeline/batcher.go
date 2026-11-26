@@ -155,7 +155,7 @@ func (b *batcher) send(albumID string, group []uploaded) {
 			}
 			if !r.CreationTime.IsZero() {
 				// Best effort: the date never changes what happens to the upload.
-				g := []store.GoogleDate{{MediaID: r.MediaItemID, Time: r.CreationTime}}
+				g := []store.GoogleDate{{MediaID: r.MediaItemID, Time: r.CreationTime, URL: r.ProductURL}}
 				if err := b.p.store.SetGoogleDates(g, time.Now()); err != nil {
 					u.log.Debug("record Google date", zap.Error(err))
 				}

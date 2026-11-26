@@ -18,6 +18,7 @@ type DateRow struct {
 	GoogleTime                                          time.Time
 	GoogleCheckedAt                                     time.Time
 	GoogleMissing                                       bool
+	GoogleURL                                           string // "" = unknown
 }
 
 // TakenDate is a looked-up expected date; zero Time records TakenNone.
@@ -31,6 +32,7 @@ type GoogleDate struct {
 	MediaID string
 	Time    time.Time // zero when Missing
 	Missing bool
+	URL     string // productUrl; stored only when non-empty
 }
 
 // unixOrNil converts a time to Unix seconds, or NULL for the zero time.
@@ -56,7 +58,7 @@ func (s *Store) GetDateRows() ([]DateRow, error) {
 		`SELECT source_path, COALESCE(source_zip, ''), COALESCE(zip_entry, ''),
 		        COALESCE(album_name, ''), photos_media_id,
 		        taken_time, COALESCE(taken_time_source, ''),
-		        google_time, google_checked_at, google_missing
+		        google_time, google_checked_at, google_missing, COALESCE(google_url, '')
 		   FROM media_items
 		  WHERE status = 'complete'
 		    AND photos_media_id IS NOT NULL
@@ -73,7 +75,7 @@ func (s *Store) GetDateRows() ([]DateRow, error) {
 		var taken, google, checked sql.NullInt64
 		var missing int
 		if err := rows.Scan(&r.SourcePath, &r.SourceZip, &r.ZipEntry, &r.AlbumName, &r.MediaID,
-			&taken, &r.TakenSource, &google, &checked, &missing); err != nil {
+			&taken, &r.TakenSource, &google, &checked, &missing, &r.GoogleURL); err != nil {
 			return nil, err
 		}
 		r.TakenTime = timeFromNull(taken)
@@ -110,6 +112,7 @@ func (s *Store) SetTakenDates(ds []TakenDate) error {
 
 // SetGoogleDates records Google's answer for each media ID in one
 // transaction, on every row with that ID (Google dedupes identical uploads).
+// An empty URL leaves a stored link alone.
 func (s *Store) SetGoogleDates(ds []GoogleDate, checkedAt time.Time) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -123,9 +126,10 @@ func (s *Store) SetGoogleDates(ds []GoogleDate, checkedAt time.Time) error {
 		}
 		if _, err := tx.Exec(
 			`UPDATE media_items
-			    SET google_time = ?, google_checked_at = ?, google_missing = ?
+			    SET google_time = ?, google_checked_at = ?, google_missing = ?,
+			        google_url = COALESCE(NULLIF(?, ''), google_url)
 			  WHERE photos_media_id = ?`,
-			unixOrNil(d.Time), checkedAt.Unix(), missing, d.MediaID,
+			unixOrNil(d.Time), checkedAt.Unix(), missing, d.URL, d.MediaID,
 		); err != nil {
 			return err
 		}
