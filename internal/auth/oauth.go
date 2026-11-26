@@ -57,7 +57,7 @@ func GetClient(ctx context.Context, cfg *oauth2.Config) (*http.Client, error) {
 		return nil, err
 	}
 	if tok, err := loadToken(tokenPath); err == nil {
-		return cfg.Client(ctx, tok), nil
+		return cfg.Client(withTransport(ctx), tok), nil
 	}
 	return Login(ctx, cfg)
 }
@@ -80,7 +80,26 @@ func Login(ctx context.Context, cfg *oauth2.Config) (*http.Client, error) {
 	} else {
 		fmt.Printf("Token cached to %s\n", tokenPath)
 	}
-	return cfg.Client(ctx, tok), nil
+	return cfg.Client(withTransport(ctx), tok), nil
+}
+
+// deadConnectionTransport is the transport for every call to Google,
+// including token refreshes. Uploads can be large and slow, so there is no
+// limit on a whole request; these settings only drop a connection that has
+// gone dead (no response headers within 2 minutes of sending the request, or
+// an HTTP/2 connection that stops answering pings), which would otherwise
+// hang a run for hours.
+func deadConnectionTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.ResponseHeaderTimeout = 2 * time.Minute
+	t.HTTP2 = &http.HTTP2Config{SendPingTimeout: 30 * time.Second, PingTimeout: 15 * time.Second}
+	return t
+}
+
+// withTransport makes the oauth2 client built from ctx use
+// deadConnectionTransport. Never set http.Client.Timeout: it would cap uploads.
+func withTransport(ctx context.Context) context.Context {
+	return context.WithValue(ctx, oauth2.HTTPClient, &http.Client{Transport: deadConnectionTransport()})
 }
 
 // runLoopbackFlow starts an ephemeral local HTTP server, opens the system

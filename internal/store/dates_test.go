@@ -208,3 +208,46 @@ func TestSetMediaComplete_NewIDClearsGoogleDate(t *testing.T) {
 		t.Errorf("same ID lost the Google date: %+v", r)
 	}
 }
+
+// Break caught: the media-ID index migration failing on a ledger that already
+// holds date columns and rows, or leaving the date queries broken.
+func TestMigration00007_MediaIDIndex(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "m.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	goose.SetBaseFS(embedMigrations)
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		t.Fatal(err)
+	}
+	goose.SetLogger(goose.NopLogger())
+	if err := goose.UpTo(db, "migrations", 6); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO media_items (source_path, status, photos_media_id) VALUES ('/s/a.jpg', 'complete', 'm-1')`); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open (applies later migrations): %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	var n int
+	if err := st.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_media_photos_media_id'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("index idx_media_photos_media_id not created")
+	}
+	rows, err := st.GetDateRows()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].MediaID != "m-1" {
+		t.Errorf("GetDateRows = %+v, want the one row", rows)
+	}
+}

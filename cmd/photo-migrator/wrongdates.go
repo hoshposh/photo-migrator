@@ -46,6 +46,7 @@ type dateReport struct {
 
 type wrongDate struct {
 	MediaID, File, Album, SourceZip, InZipPath string // the shown row
+	SourcePath                                 string // the shown row's file, for directory mode
 	ShouldBe, GoogleHas                        time.Time
 	OtherExpected                              []time.Time // other rows' dates > 24 h from ShouldBe
 	Copies                                     []dateCopy  // every row for this media ID
@@ -62,6 +63,43 @@ func rowEntry(r store.DateRow) string {
 		return r.ZipEntry
 	}
 	return inZipPath(r.SourcePath, r.SourceZip)
+}
+
+// rowOrder is the key that orders a media ID's rows and the report: the zip,
+// then the path inside it (the file path in directory mode), so the order
+// does not depend on the staging directory.
+func rowOrder(r store.DateRow) (string, string) {
+	if e := rowEntry(r); e != "" {
+		return r.SourceZip, e
+	}
+	return r.SourceZip, r.SourcePath
+}
+
+func rowLess(a, b store.DateRow) bool {
+	az, ap := rowOrder(a)
+	bz, bp := rowOrder(b)
+	if az != bz {
+		return az < bz
+	}
+	return ap < bp
+}
+
+// shownRow picks the row a photo is reported under: preferably one with a
+// sidecar date (so a copy whose sidecar was not found does not hide the
+// photo), and among those one in an album. g must be sorted by rowLess.
+func shownRow(g []store.DateRow) store.DateRow {
+	for _, ok := range []func(store.DateRow) bool{
+		func(r store.DateRow) bool { return r.AlbumName != "" && r.TakenSource == store.TakenFromSidecar },
+		func(r store.DateRow) bool { return r.TakenSource == store.TakenFromSidecar },
+		func(r store.DateRow) bool { return r.AlbumName != "" },
+	} {
+		for _, r := range g {
+			if ok(r) {
+				return r
+			}
+		}
+	}
+	return g[0]
 }
 
 func absDuration(d time.Duration) time.Duration {
@@ -84,26 +122,15 @@ func judgeDates(rows []store.DateRow) dateReport {
 	}
 
 	type sortable struct {
-		w    wrongDate
-		path string
+		w     wrongDate
+		shown store.DateRow
 	}
 	var rep dateReport
 	var wrong []sortable
 	for _, id := range ids {
 		g := groups[id]
-		sort.SliceStable(g, func(i, j int) bool {
-			if g[i].SourceZip != g[j].SourceZip {
-				return g[i].SourceZip < g[j].SourceZip
-			}
-			return g[i].SourcePath < g[j].SourcePath
-		})
-		shown := g[0]
-		for _, r := range g {
-			if r.AlbumName != "" {
-				shown = r
-				break
-			}
-		}
+		sort.SliceStable(g, func(i, j int) bool { return rowLess(g[i], g[j]) })
+		shown := shownRow(g)
 		missing := false
 		for _, r := range g {
 			missing = missing || r.GoogleMissing
@@ -122,7 +149,7 @@ func judgeDates(rows []store.DateRow) dateReport {
 
 		w := wrongDate{
 			MediaID: id, File: filepath.Base(shown.SourcePath), Album: shown.AlbumName,
-			SourceZip: shown.SourceZip, InZipPath: rowEntry(shown),
+			SourceZip: shown.SourceZip, InZipPath: rowEntry(shown), SourcePath: shown.SourcePath,
 			ShouldBe: shown.TakenTime, GoogleHas: shown.GoogleTime,
 		}
 		if w.InZipPath != "" {
@@ -135,15 +162,10 @@ func judgeDates(rows []store.DateRow) dateReport {
 			}
 		}
 		if absDuration(w.ShouldBe.Sub(w.GoogleHas)) > wrongDateThreshold || len(w.OtherExpected) > 0 {
-			wrong = append(wrong, sortable{w, shown.SourcePath})
+			wrong = append(wrong, sortable{w, shown})
 		}
 	}
-	sort.SliceStable(wrong, func(i, j int) bool {
-		if wrong[i].w.SourceZip != wrong[j].w.SourceZip {
-			return wrong[i].w.SourceZip < wrong[j].w.SourceZip
-		}
-		return wrong[i].path < wrong[j].path
-	})
+	sort.SliceStable(wrong, func(i, j int) bool { return rowLess(wrong[i].shown, wrong[j].shown) })
 	for _, s := range wrong {
 		rep.Wrong = append(rep.Wrong, s.w)
 	}
@@ -164,6 +186,7 @@ func runWrongDates(ctx context.Context, st *store.Store, newClient func() (*phot
 	if err := fillTakenDates(ctx, st, rows, opts.TakeoutDir, logger); err != nil {
 		return err
 	}
+	// rows predates fillTakenDates; fine, as a photo whose date was found just now was never listed.
 	var recheck []string
 	if opts.Recheck {
 		for _, w := range judgeDates(rows).Wrong {
@@ -369,22 +392,19 @@ func printWrongDatesText(w io.Writer, rep dateReport) {
 				album = "-"
 			}
 			_, _ = fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\t%s\n", d.File, album,
-				d.ShouldBe.UTC().Format(wrongDateTime), d.GoogleHas.UTC().Format(wrongDateTime), copyLabel(d.SourceZip, d.InZipPath))
+				d.ShouldBe.UTC().Format(wrongDateTime), d.GoogleHas.UTC().Format(wrongDateTime), copyLabel(d))
 		}
 		_ = tw.Flush()
+		var notes []string
 		for _, d := range rep.Wrong {
 			for _, t := range d.OtherExpected {
-				_, _ = fmt.Fprintf(w, "\n  %s: another copy of this photo expects %s.", d.File, t.UTC().Format(wrongDateTime))
-			}
-			if len(d.Copies) > 1 {
-				places := make([]string, len(d.Copies))
-				for i, c := range d.Copies {
-					places[i] = copyLabel(c.SourceZip, c.InZipPath)
-				}
-				_, _ = fmt.Fprintf(w, "\n  %s: the same photo was uploaded from %s.", d.File, strings.Join(places, "; "))
+				notes = append(notes, fmt.Sprintf("  %s: another copy of this photo expects %s.\n", d.File, t.UTC().Format(wrongDateTime)))
 			}
 		}
-		_, _ = fmt.Fprint(w, "\n\n  Fix each in Google Photos: open the photo → ⋮ → Edit date & time.\n  Dates are shown in UTC.\n  After fixing some, run: photo-migrator wrong-dates --recheck\n")
+		if len(notes) > 0 {
+			_, _ = fmt.Fprint(w, "\n"+strings.Join(notes, ""))
+		}
+		_, _ = fmt.Fprint(w, "\n  Fix each in Google Photos: open the photo → ⋮ → Edit date & time.\n  Dates are shown in UTC.\n  After fixing some, run: photo-migrator wrong-dates --recheck\n")
 	}
 
 	var parts []string
@@ -406,12 +426,12 @@ func printWrongDatesText(w io.Writer, rep dateReport) {
 	_, _ = fmt.Fprintln(w)
 }
 
-// copyLabel is "zip / path" for a zip row, "" in directory mode.
-func copyLabel(zipPath, entry string) string {
-	if zipPath == "" {
-		return ""
+// copyLabel is "zip / path" for a zip row, the file's path in directory mode.
+func copyLabel(d wrongDate) string {
+	if d.SourceZip == "" {
+		return d.SourcePath
 	}
-	return filepath.Base(zipPath) + " / " + entry
+	return filepath.Base(d.SourceZip) + " / " + d.InZipPath
 }
 
 type wrongDateJSON struct {
@@ -491,8 +511,8 @@ photos currently listed, so the ones you fixed drop off the list.
 
 Photos not judged are counted at the end: those whose sidecar has no date,
 those Google does not let this tool read (already in your library before
-this tool, or deleted), and
-those not checked yet (for example a zip missing from --takeout-dir).
+this tool, or deleted), and those not checked yet (for example a zip missing
+from --takeout-dir).
 
 Flags:
   --takeout-dir <dir>  where the Takeout zips are (or set takeout-dir in the config)

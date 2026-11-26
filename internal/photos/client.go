@@ -2,9 +2,11 @@
 package photos
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"path"
 	"strconv"
@@ -27,6 +29,11 @@ var ErrAuthFailed = errors.New("google rejected the saved sign-in")
 // maxRetryAfter caps how long a Retry-After header can make a request wait.
 const maxRetryAfter = 2 * time.Minute
 
+// defaultCallTimeout limits each attempt of every API call except byte
+// uploads, which may take long for a large file. A request whose answer never
+// comes is then retried instead of hanging the run.
+const defaultCallTimeout = 2 * time.Minute
+
 // Client wraps the Google Photos Library API. It is safe for concurrent use.
 type Client struct {
 	http    *http.Client
@@ -39,12 +46,15 @@ type Client struct {
 	// time, and write calls share a per-user limit (HTTP 429 when exceeded).
 	// Byte uploads stay parallel.
 	writeMu sync.Mutex
+	// callTimeout limits each attempt of a non-upload call, including
+	// reading its response.
+	callTimeout time.Duration
 }
 
 // New returns a Client that uses the provided *http.Client (which must already
 // carry OAuth2 credentials via its Transport).
 func New(httpClient *http.Client, opts ...Option) *Client {
-	c := &Client{http: httpClient, baseURL: baseURL}
+	c := &Client{http: httpClient, baseURL: baseURL, callTimeout: defaultCallTimeout}
 	for _, o := range opts {
 		o(c)
 	}
@@ -100,6 +110,10 @@ func WithRateLimit(perSecond float64) Option {
 // HTTP 429 (rate limit) and 5xx (server) errors.
 //
 // If the request has a non-nil GetBody, the body is reset before each retry.
+//
+// Every attempt of a call other than a byte upload has a deadline
+// (callTimeout) that covers reading the response, so the returned response's
+// body is already in memory. An attempt that runs out of time is retried.
 func (c *Client) doWithRetry(ctx context.Context, req *http.Request) (*http.Response, error) {
 	const maxRetries = 6
 	backoff := time.Second
@@ -119,16 +133,20 @@ func (c *Client) doWithRetry(ctx context.Context, req *http.Request) (*http.Resp
 				return nil, err
 			}
 		}
-		resp, err := c.http.Do(req.WithContext(ctx))
+		resp, err := c.do(ctx, req)
 		if err != nil {
 			// The token refresh was rejected: not transient, don't retry.
 			var rerr *oauth2.RetrieveError
 			if errors.As(err, &rerr) {
 				return nil, fmt.Errorf("%w (%w); run 'photo-migrator auth' to sign in again", ErrAuthFailed, err)
 			}
-			// Network error — retry if we have attempts left.
+			// Network error or timeout — retry if we have attempts left.
 			if attempt < maxRetries {
-				loggerFrom(ctx).Warn("retrying after network error",
+				msg := "retrying after network error"
+				if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+					msg = "retrying after timeout"
+				}
+				loggerFrom(ctx).Warn(msg,
 					zap.String("call", callName(req)), zap.Int("attempt", attempt+1),
 					zap.String("wait", backoff.String()), zap.Error(err))
 				if waitErr := sleepOrCancel(ctx, backoff); waitErr != nil {
@@ -169,6 +187,27 @@ func (c *Client) doWithRetry(ctx context.Context, req *http.Request) (*http.Resp
 		}
 	}
 	return nil, fmt.Errorf("unreachable")
+}
+
+// do sends one attempt of req. A byte upload runs under ctx alone; any other
+// call gets its own deadline, and its body is read under that deadline.
+func (c *Client) do(ctx context.Context, req *http.Request) (*http.Response, error) {
+	if callName(req) == "upload" {
+		return c.http.Do(req.WithContext(ctx))
+	}
+	actx, cancel := context.WithTimeout(ctx, c.callTimeout)
+	defer cancel()
+	resp, err := c.http.Do(req.WithContext(actx))
+	if err != nil {
+		return nil, err
+	}
+	buf, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		return nil, fmt.Errorf("read %s response: %w", callName(req), err)
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(buf))
+	return resp, nil
 }
 
 // retryAfter parses a Retry-After header value, either delay-seconds or an

@@ -175,3 +175,30 @@ func TestBatchGet_ItemStatusCodes(t *testing.T) {
 		}
 	}
 }
+
+// Break caught: a request whose answer never comes hanging the run forever
+// (a real run hung for 8 hours) instead of being retried.
+func TestBatchGet_RetriesAfterTimeout(t *testing.T) {
+	release := make(chan struct{})
+	var n atomic.Int32
+	c, calls := batchGetClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if n.Add(1) == 1 {
+			<-release // never answers while the test runs
+			return
+		}
+		_, _ = w.Write([]byte(`{"mediaItemResults":[{"mediaItem":{"id":"a","mediaMetadata":{"creationTime":"2019-06-14T18:02:00Z"}}}]}`))
+	})
+	t.Cleanup(func() { close(release) }) // runs before the server is closed
+	c.callTimeout = 100 * time.Millisecond
+
+	got, err := c.BatchGet(context.Background(), []string{"a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Missing {
+		t.Errorf("got %+v, want one found item", got)
+	}
+	if n := calls.Load(); n != 2 {
+		t.Errorf("%d requests, want 2", n)
+	}
+}

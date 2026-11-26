@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/oauth2"
 )
@@ -204,5 +205,20 @@ func TestLogin_SignsInAgainDespiteCachedToken(t *testing.T) {
 	}
 	if !strings.Contains(string(saved), `"access_token":"at"`) {
 		t.Errorf("token.json was not replaced with the new token: %s", saved)
+	}
+}
+
+// Break caught: a dead connection to Google hanging a run for hours, or a
+// total time limit that would cut off a large, slow upload.
+func TestDeadConnectionTransport(t *testing.T) {
+	tr := deadConnectionTransport()
+	if tr.ResponseHeaderTimeout != 2*time.Minute {
+		t.Errorf("ResponseHeaderTimeout = %v, want 2m", tr.ResponseHeaderTimeout)
+	}
+	if tr.HTTP2 == nil || tr.HTTP2.SendPingTimeout != 30*time.Second || tr.HTTP2.PingTimeout != 15*time.Second {
+		t.Errorf("HTTP2 = %+v, want SendPingTimeout 30s, PingTimeout 15s", tr.HTTP2)
+	}
+	if tr == http.DefaultTransport {
+		t.Error("the default transport was changed instead of a copy")
 	}
 }

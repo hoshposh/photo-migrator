@@ -105,6 +105,53 @@ func TestJudgeDates(t *testing.T) {
 		}
 	})
 
+	// Break caught: a photo judged "no sidecar date" because the album copy's
+	// sidecar was not found, although another copy has one.
+	t.Run("shown copy is one with a sidecar date", func(t *testing.T) {
+		rep := judgeDates([]store.DateRow{
+			wdRow("Trip/a.jpg", "z1", "Trip", "m-1", time.Time{}, wdTaken.Add(25*h)),
+			wdRow("Photos from 2019/a.jpg", "z1", "", "m-1", wdTaken, wdTaken.Add(25*h)),
+		})
+		if len(rep.Wrong) != 1 || rep.NoSidecarDate != 0 {
+			t.Fatalf("got %d wrong, %d no sidecar date; want 1, 0", len(rep.Wrong), rep.NoSidecarDate)
+		}
+		if w := rep.Wrong[0]; w.InZipPath != "Photos from 2019/a.jpg" || !w.ShouldBe.Equal(wdTaken) {
+			t.Errorf("shown %q, should be %v; want the dated copy, %v", w.InZipPath, w.ShouldBe, wdTaken)
+		}
+	})
+
+	t.Run("dated copy that matches Google is fine", func(t *testing.T) {
+		rep := judgeDates([]store.DateRow{
+			wdRow("Trip/a.jpg", "z1", "Trip", "m-1", time.Time{}, wdTaken),
+			wdRow("Photos from 2019/a.jpg", "z1", "", "m-1", wdTaken, wdTaken),
+		})
+		if len(rep.Wrong) != 0 || rep.NoSidecarDate != 0 {
+			t.Errorf("got %d wrong, %d no sidecar date; want 0, 0", len(rep.Wrong), rep.NoSidecarDate)
+		}
+	})
+
+	// Break caught: the shown copy and the list order depending on the
+	// staging directory instead of the path inside the zip.
+	t.Run("first means first inside the zip", func(t *testing.T) {
+		row := func(staging, entry, id string) store.DateRow {
+			r := wdRow(entry, "z1", "", id, wdTaken, wdTaken.Add(25*h))
+			r.SourcePath = staging
+			return r
+		}
+		rep := judgeDates([]store.DateRow{
+			row("/s1/B/x.jpg", "B/x.jpg", "m-1"),
+			row("/s2/A/x.jpg", "A/x.jpg", "m-1"),
+			row("/s0/C/y.jpg", "C/y.jpg", "m-2"),
+		})
+		var got []string
+		for _, w := range rep.Wrong {
+			got = append(got, w.InZipPath)
+		}
+		if want := []string{"A/x.jpg", "C/y.jpg"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("listed %v, want %v", got, want)
+		}
+	})
+
 	t.Run("copies that disagree by days are listed", func(t *testing.T) {
 		other := wdTaken.Add(72 * h)
 		rep := judgeDates([]store.DateRow{
@@ -740,6 +787,9 @@ func TestWrongDates_DirMode(t *testing.T) {
 	if !strings.Contains(out, "a.jpg") || !strings.Contains(out, "1 not checked yet") {
 		t.Errorf("want a.jpg listed and gone.jpg unchecked:\n%s", out)
 	}
+	if !strings.Contains(out, photo) {
+		t.Errorf("ZIP / PATH column must show the file's path in directory mode:\n%s", out)
+	}
 }
 
 // Break caught: the command needing credentials, or failing, when there is
@@ -815,5 +865,47 @@ func TestWrongDates_RecheckHintIsTextOnly(t *testing.T) {
 	}
 	if strings.Contains(out, "--recheck") {
 		t.Errorf("JSON output must not carry the hint:\n%s", out)
+	}
+}
+
+// Break caught: the text report repeating every copy of a photo (JSON keeps
+// them), or printing two blank lines in a row.
+func TestPrintWrongDatesText_Layout(t *testing.T) {
+	two := dateReport{Wrong: []wrongDate{{
+		MediaID: "m-1", File: "a.jpg", Album: "Trip", SourceZip: "/t/z1.zip", InZipPath: "Trip/a.jpg",
+		ShouldBe: wdTaken, GoogleHas: wdGoogle,
+		Copies: []dateCopy{{"/t/z1.zip", "Trip/a.jpg", "Trip"}, {"/t/z2.zip", "Photos from 2019/a.jpg", ""}},
+	}}, NoSidecarDate: 2}
+	other := two
+	other.Wrong = []wrongDate{two.Wrong[0]}
+	other.Wrong[0].OtherExpected = []time.Time{wdTaken.Add(72 * time.Hour)}
+
+	one := dateReport{Wrong: []wrongDate{two.Wrong[0]}}
+	one.Wrong[0].Copies = one.Wrong[0].Copies[:1]
+
+	for name, rep := range map[string]dateReport{"one copy": one, "copies": two, "other date": other, "none wrong": {NotChecked: 1}} {
+		var b bytes.Buffer
+		printWrongDatesText(&b, rep)
+		out := b.String()
+		if strings.Contains(out, "uploaded from") {
+			t.Errorf("%s: copies listed in the text output:\n%s", name, out)
+		}
+		if strings.Contains(out, "\n\n\n") {
+			t.Errorf("%s: two blank lines in a row:\n%q", name, out)
+		}
+	}
+	var b bytes.Buffer
+	printWrongDatesText(&b, other)
+	if !strings.Contains(b.String(), "another copy of this photo expects 2019-06-17 18:02 UTC") {
+		t.Errorf("other copy's date missing:\n%s", b.String())
+	}
+}
+
+// Break caught: help text wrapped so that a line ends mid-phrase.
+func TestWrongDatesCmd_HelpWrap(t *testing.T) {
+	for _, line := range strings.Split(newWrongDatesCmd().Long, "\n") {
+		if strings.HasSuffix(strings.TrimSpace(line), " and") {
+			t.Errorf("help line ends with a dangling 'and': %q", line)
+		}
 	}
 }
