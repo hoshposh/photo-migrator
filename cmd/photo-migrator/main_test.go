@@ -1225,11 +1225,16 @@ func TestProcessZips_SummarisesHeldBackFilesPerZip(t *testing.T) {
 // Break caught: log lines (uploads, failures, held-back files, summaries)
 // that don't say which zip they belong to, or that carry the "zip" key twice.
 func TestProcessZips_EveryLineNamesItsZip(t *testing.T) {
+	var batchCalls atomic.Int32
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/uploads"):
 			_, _ = io.WriteString(w, "tok")
 		case strings.HasSuffix(r.URL.Path, "/mediaItems:batchCreate"):
+			if batchCalls.Add(1) == 1 { // one 429, so a retry line is logged too
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
 			_, _ = io.WriteString(w, `{"newMediaItemResults":[{"uploadToken":"tok","status":{},"mediaItem":{"id":"m"}}]}`)
 		case strings.HasSuffix(r.URL.Path, "/albums"):
 			_, _ = io.WriteString(w, `{"id":"album-1","title":"Trip"}`)
@@ -1265,6 +1270,9 @@ func TestProcessZips_EveryLineNamesItsZip(t *testing.T) {
 
 	if logs.Len() < 6 {
 		t.Fatalf("only %d log lines; expected uploads, album, held-back, skipped and progress lines", logs.Len())
+	}
+	if logs.FilterMessageSnippet("retrying after HTTP 429").Len() != 1 {
+		t.Errorf("expected one retry line from the 429: %v", logs.All())
 	}
 	for _, e := range logs.All() {
 		n := 0

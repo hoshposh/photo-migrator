@@ -6,10 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"path"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"go.uber.org/zap"
 	"golang.org/x/oauth2"
 	"golang.org/x/time/rate"
 )
@@ -49,6 +52,36 @@ func New(httpClient *http.Client, opts ...Option) *Client {
 
 // Option configures a Client.
 type Option func(*Client)
+
+type loggerKey struct{}
+
+// WithLogger returns a context whose API requests log their retries through
+// l. Callers pass their per-file logger, so retry lines carry the same
+// fields (file, album, zip) as the rest of that file's log.
+func WithLogger(ctx context.Context, l *zap.Logger) context.Context {
+	return context.WithValue(ctx, loggerKey{}, l)
+}
+
+func loggerFrom(ctx context.Context) *zap.Logger {
+	if l, ok := ctx.Value(loggerKey{}).(*zap.Logger); ok && l != nil {
+		return l
+	}
+	return zap.NewNop()
+}
+
+// callName names an API request for logs: upload, batchCreate, createAlbum.
+func callName(req *http.Request) string {
+	switch p := path.Base(req.URL.Path); {
+	case p == "uploads":
+		return "upload"
+	case strings.HasSuffix(p, ":batchCreate"):
+		return "batchCreate"
+	case p == "albums":
+		return "createAlbum"
+	default:
+		return p
+	}
+}
 
 // WithRateLimit limits the client to perSecond API requests per second,
 // counting every request and retry. perSecond <= 0 means no limit.
@@ -92,6 +125,9 @@ func (c *Client) doWithRetry(ctx context.Context, req *http.Request) (*http.Resp
 			}
 			// Network error — retry if we have attempts left.
 			if attempt < maxRetries {
+				loggerFrom(ctx).Warn("retrying after network error",
+					zap.String("call", callName(req)), zap.Int("attempt", attempt+1),
+					zap.String("wait", backoff.String()), zap.Error(err))
 				if waitErr := sleepOrCancel(ctx, backoff); waitErr != nil {
 					return nil, waitErr
 				}
@@ -109,9 +145,18 @@ func (c *Client) doWithRetry(ctx context.Context, req *http.Request) (*http.Resp
 			}
 			// Wait at least as long as Google asks (Retry-After), if it does.
 			wait := backoff
-			if ra := retryAfter(resp.Header.Get("Retry-After"), time.Now()); ra > wait {
+			ra := retryAfter(resp.Header.Get("Retry-After"), time.Now())
+			if ra > wait {
 				wait = minDuration(ra, maxRetryAfter)
 			}
+			fields := []zap.Field{
+				zap.String("call", callName(req)), zap.Int("status", resp.StatusCode),
+				zap.Int("attempt", attempt+1), zap.String("wait", wait.String()),
+			}
+			if ra > 0 {
+				fields = append(fields, zap.String("retry_after", ra.String()))
+			}
+			loggerFrom(ctx).Warn(fmt.Sprintf("retrying after HTTP %d", resp.StatusCode), fields...)
 			if waitErr := sleepOrCancel(ctx, wait); waitErr != nil {
 				return nil, waitErr
 			}

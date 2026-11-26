@@ -12,6 +12,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // fakeAPI serves /uploads and /mediaItems:batchCreate. Hooks let a test
@@ -141,5 +144,41 @@ func TestRetryAfterIsHonoured(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed < 1900*time.Millisecond {
 		t.Errorf("retried after %v, want >= 2s (Retry-After: 2)", elapsed)
+	}
+}
+
+// Break caught: retries happening silently, so a run stalls for a minute
+// with nothing in the log to say why (e.g. HTTP 429 with Retry-After: 60).
+func TestRetryIsLogged(t *testing.T) {
+	var calls atomic.Int32
+	f := &fakeAPI{onBatch: func(w http.ResponseWriter) bool {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return true
+		}
+		return false
+	}}
+	c := f.client(t)
+	core, logs := observer.New(zap.DebugLevel)
+	ctx := WithLogger(context.Background(), zap.New(core).With(zap.String("file", "a.jpg")))
+
+	if _, err := c.UploadMedia(ctx, mediaFile(t), "", "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	got := logs.FilterMessageSnippet("retrying after HTTP 429").All()
+	if len(got) != 1 {
+		t.Fatalf("want 1 retry warning, got %d: %v", len(got), logs.All())
+	}
+	if got[0].Level != zap.WarnLevel {
+		t.Errorf("retry logged at %v, want warn", got[0].Level)
+	}
+	want := map[string]any{"call": "batchCreate", "status": int64(429), "attempt": int64(1), "retry_after": "1s", "wait": "1s", "file": "a.jpg"}
+	m := got[0].ContextMap()
+	for k, v := range want {
+		if m[k] != v {
+			t.Errorf("field %s = %v (%T), want %v", k, m[k], m[k], v)
+		}
 	}
 }
