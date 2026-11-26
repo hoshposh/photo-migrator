@@ -256,12 +256,18 @@ func (s *Store) SetMediaUploadToken(sourcePath, uploadToken string) error {
 }
 
 // SetMediaComplete records the Google Photos media ID on successful creation.
+// A different ID than before means a new photo, so Google's date for the old
+// one is cleared; the same ID keeps it.
 func (s *Store) SetMediaComplete(sourcePath, photosMediaID string) error {
 	_, err := s.db.Exec(
 		`UPDATE media_items
-		    SET status = ?, photos_media_id = ?, updated_at = CURRENT_TIMESTAMP
+		    SET status = ?,
+		        google_time       = CASE WHEN photos_media_id IS ? THEN google_time ELSE NULL END,
+		        google_checked_at = CASE WHEN photos_media_id IS ? THEN google_checked_at ELSE NULL END,
+		        google_missing    = CASE WHEN photos_media_id IS ? THEN google_missing ELSE 0 END,
+		        photos_media_id = ?, updated_at = CURRENT_TIMESTAMP
 		  WHERE source_path = ?`,
-		string(StatusComplete), photosMediaID, sourcePath,
+		string(StatusComplete), photosMediaID, photosMediaID, photosMediaID, photosMediaID, sourcePath,
 	)
 	return err
 }
