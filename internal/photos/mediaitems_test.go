@@ -3,6 +3,7 @@ package photos
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -126,5 +127,50 @@ func TestBatchGet_RetriesOn429(t *testing.T) {
 	}
 	if calls.Load() != 2 {
 		t.Errorf("%d requests, want 2", calls.Load())
+	}
+}
+
+func TestBatchGet_ShortResponseIsAnError(t *testing.T) {
+	c, _ := batchGetClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"mediaItemResults":[{"mediaItem":{"id":"a","mediaMetadata":{"creationTime":"2019-06-14T18:02:00Z"}}}]}`))
+	})
+
+	got, err := c.BatchGet(context.Background(), []string{"a", "b"})
+	if err == nil || !strings.Contains(err.Error(), "1 results for 2 IDs") {
+		t.Errorf("err = %v, want a '1 results for 2 IDs' error", err)
+	}
+	if got != nil {
+		t.Errorf("got %+v, want no results", got)
+	}
+}
+
+func TestBatchGet_ItemStatusCodes(t *testing.T) {
+	cases := []struct {
+		code    int
+		missing bool
+	}{
+		{5, true},
+		{7, true},
+		{14, false},
+	}
+	for _, tc := range cases {
+		c, _ := batchGetClient(t, func(w http.ResponseWriter, r *http.Request) {
+			_, _ = fmt.Fprintf(w, `{"mediaItemResults":[{"status":{"code":%d,"message":"msg"}}]}`, tc.code)
+		})
+		got, err := c.BatchGet(context.Background(), []string{"a"})
+		if tc.missing {
+			if err != nil || len(got) != 1 || !got[0].Missing || got[0].Status != "msg" {
+				t.Errorf("code %d: got (%+v, %v), want one Missing item", tc.code, got, err)
+			}
+			continue
+		}
+		if err == nil || got != nil {
+			t.Fatalf("code %d: got (%+v, %v), want an error and no results", tc.code, got, err)
+		}
+		for _, want := range []string{"a", "14", "msg"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("code %d: error %q does not mention %q", tc.code, err, want)
+			}
+		}
 	}
 }

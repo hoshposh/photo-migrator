@@ -24,6 +24,12 @@ type ItemDate struct {
 	Status       string    // that status message, for logging
 }
 
+// google.rpc.Code values that mean a media item is gone or unreadable.
+const (
+	statusNotFound         = 5
+	statusPermissionDenied = 7
+)
+
 type mediaMetadata struct {
 	CreationTime string `json:"creationTime"`
 }
@@ -87,20 +93,28 @@ func (c *Client) BatchGet(ctx context.Context, ids []string) ([]ItemDate, error)
 		return nil, fmt.Errorf("decode batchGet response: %w", err)
 	}
 
+	if len(parsed.MediaItemResults) != len(ids) {
+		return nil, fmt.Errorf("batchGet: %d results for %d IDs", len(parsed.MediaItemResults), len(ids))
+	}
 	dates := make([]ItemDate, len(ids))
 	for i, id := range ids {
 		d := ItemDate{ID: id}
-		switch {
-		case i >= len(parsed.MediaItemResults):
-			d.Missing, d.Status = true, "no result returned"
-		case parsed.MediaItemResults[i].MediaItem == nil:
-			d.Missing = true
-			if st := parsed.MediaItemResults[i].Status; st != nil {
-				d.Status = st.Message
-			}
-		default:
-			d.CreationTime = parseCreationTime(parsed.MediaItemResults[i].MediaItem.MediaMetadata.CreationTime)
+		r := parsed.MediaItemResults[i]
+		if r.MediaItem != nil {
+			d.CreationTime = parseCreationTime(r.MediaItem.MediaMetadata.CreationTime)
+			dates[i] = d
+			continue
 		}
+		// Only NOT_FOUND and PERMISSION_DENIED mean the item is gone or not
+		// readable by this app. Anything else may be transient, so fail the
+		// batch rather than let the caller record the item as missing.
+		if r.Status == nil {
+			return nil, fmt.Errorf("batchGet: item %s: result has neither a media item nor a status", id)
+		}
+		if r.Status.Code != statusNotFound && r.Status.Code != statusPermissionDenied {
+			return nil, fmt.Errorf("batchGet: item %s: status code %d: %s", id, r.Status.Code, r.Status.Message)
+		}
+		d.Missing, d.Status = true, r.Status.Message
 		dates[i] = d
 	}
 	return dates, nil
