@@ -301,6 +301,19 @@ You can then open [photos.google.com](https://photos.google.com/), click
 
 ---
 
+## Checking for files that won't be migrated
+
+A migration uploads every recognised photo and video, holds some back (Locked Folder files, motion-photo video parts) and skips everything else. To see what is skipped, before or during a migration:
+
+```bash
+./photo-migrator scan --skipped                 # grouped report
+./photo-migrator scan --skipped --format json   # full list
+```
+
+This reads the zips in place (nothing is extracted) and does not open the database, so it is safe to run at any time, including on new Takeout downloads and while a `run` is in progress. It reports files that are not a recognised photo or video (for example PDFs), macOS `._` files, and how many `.json` metadata files there are. During a run, each zip that contains unrecognised files also logs one warning listing their types.
+
+---
+
 ## Motion photos and videos with unusual names
 
 Takeout exports a motion photo (e.g. from a Pixel phone) as two files: the still image (`PXL_x.MP.jpg` or `PXL_x.RAW-01.MP.COVER.jpg`) and its video (`PXL_x.MP`, `PXL_x.MP~2` or `PXL_x.RAW-01.MP.COVER`). The still may be in a different zip from its video. The still is uploaded as a normal photo. The Google Photos API cannot rebuild a motion photo, though, so its video would appear as a separate video next to the still. These videos are therefore **held back** with status `motion_video`; `status` counts them and `motion-videos` lists them (`--extract <dir>` pulls them out).
@@ -361,6 +374,7 @@ photo-migrator config init                     # write starter config to ~/.conf
 photo-migrator config show                     # print active configuration
 photo-migrator auth        --credentials creds.json  # one-time OAuth2 setup
 photo-migrator scan        --takeout-dir /path/to/zips/
+photo-migrator scan        --skipped [--format json]   # read-only: files a migration would not upload
 photo-migrator upload      [--staging-dir ...] [--workers N] [--rate-limit N]
 photo-migrator run         --takeout-dir /path/to/zips/ --credentials creds.json
 photo-migrator status

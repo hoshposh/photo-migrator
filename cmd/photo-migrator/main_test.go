@@ -23,6 +23,7 @@ import (
 
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 	"golang.org/x/oauth2"
 
 	"github.com/hoshposh/photo-migrator/internal/photos"
@@ -1084,5 +1085,94 @@ func TestProcessZips_UnrecognisedVideos(t *testing.T) {
 	}
 	if len(listed) != 1 || filepath.Base(listed[0].SourcePath) != "PXL_a.MP" {
 		t.Errorf("GetMotionVideos = %+v, want just PXL_a.MP", listed)
+	}
+}
+
+// Break caught: no way to find out, before or during a migration, which
+// files in a Takeout will not be migrated (they leave no log line or row).
+func TestScanSkipped_ReportsUnmigratedFiles(t *testing.T) {
+	takeoutDir := t.TempDir()
+	writeZipEntries(t, filepath.Join(takeoutDir, "takeout-001.zip"), map[string]string{
+		"Takeout/Google Photos/Trip/a.jpg":                            "\xff\xd8\xff\xe0",
+		"Takeout/Google Photos/Trip/a.jpg.supplemental-metadata.json": "{}",
+		"Takeout/Google Photos/Trip/._a.jpg":                          "\x00\x05\x16\x07",
+		"Takeout/Google Photos/Trip/print-order.pdf":                  "%PDF-1.4",
+		"Takeout/Google Photos/Trip/PXL_a.MP":                         "\x00\x00\x00\x20ftypisom\x00\x00\x02\x00",
+		"Takeout/Google Photos/Trip/talk - 3.12.20":                   "\x00\x00\x00\x20ftypisom\x00\x00\x02\x00",
+	})
+	dbPath := filepath.Join(t.TempDir(), "m.db")
+
+	isolate(t)
+	var runErr error
+	out := captureStdout(t, func() {
+		runErr = runCLI(t, "scan", "--skipped", "--takeout-dir", takeoutDir, "--db-path", dbPath, "--format", "json")
+	})
+	if runErr != nil {
+		t.Fatalf("scan --skipped: %v", runErr)
+	}
+
+	var report struct {
+		Summary map[string]int `json:"summary"`
+		Skipped []struct {
+			Zip, Entry, Reason string
+		} `json:"skipped"`
+	}
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	got := map[string]string{}
+	for _, s := range report.Skipped {
+		got[filepath.Base(s.Entry)] = s.Reason
+	}
+	want := map[string]string{
+		"print-order.pdf": "not a recognised photo or video",
+		"._a.jpg":         "macOS resource fork (._ file)",
+	}
+	if len(got) != len(want) {
+		t.Errorf("skipped = %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%s: reason %q, want %q", k, got[k], v)
+		}
+	}
+	if report.Summary["metadata_json"] != 1 || report.Summary["recognised_media"] != 3 {
+		t.Errorf("summary = %v, want metadata_json=1 and recognised_media=3", report.Summary)
+	}
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Errorf("scan --skipped created or touched the database (stat err = %v); it must be read-only", err)
+	}
+}
+
+// Break caught: a run skipping files without saying so in the log.
+func TestProcessZips_LogsSkippedFilesPerZip(t *testing.T) {
+	zipPath := filepath.Join(t.TempDir(), "takeout-001.zip")
+	writeZipEntries(t, zipPath, map[string]string{
+		"Takeout/Google Photos/Trip/print-order.pdf": "%PDF-1.4",
+		"Takeout/Google Photos/Trip/receipt.pdf":     "%PDF-1.4",
+	})
+	st, err := store.Open(filepath.Join(t.TempDir(), "m.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	if err := st.RegisterZip(zipPath); err != nil {
+		t.Fatal(err)
+	}
+	core, logs := observer.New(zap.InfoLevel)
+	logger := zap.New(core)
+	pool := pipeline.NewPool(pipeline.Config{Workers: 1, RateLimit: 1000, DryRun: true, Logger: logger}, nil, st)
+
+	if err := processZips(context.Background(), []string{zipPath}, t.TempDir(), st, pool, logger); err != nil {
+		t.Fatal(err)
+	}
+
+	found := logs.FilterMessageSnippet("not recognised as photos or videos").All()
+	if len(found) != 1 {
+		t.Fatalf("want 1 skipped-files log line, got %d: %v", len(found), logs.All())
+	}
+	f := found[0].ContextMap()
+	if f["types"] != ".pdf ×2" || f["zip"] != "takeout-001.zip" {
+		t.Errorf("log fields = %v, want types=\".pdf ×2\" zip=\"takeout-001.zip\"", f)
 	}
 }

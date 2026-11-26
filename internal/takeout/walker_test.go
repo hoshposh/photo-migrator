@@ -70,7 +70,7 @@ func TestWalkDirectory_StopsWhenCancelled(t *testing.T) {
 	cancel()
 
 	emitted := 0
-	err := WalkDirectory(ctx, dir, "",
+	_, err := WalkDirectory(ctx, dir, "",
 		func(string, string) (bool, error) { return false, nil },
 		func(MigrationJob) { emitted++ },
 		zap.NewNop(),
@@ -134,7 +134,7 @@ func TestWalkDirectory_FlagsLockedFolderFiles(t *testing.T) {
 		}
 	}
 	locked := map[string]bool{}
-	err := WalkDirectory(context.Background(), dir, "/t/takeout-001.zip",
+	_, err := WalkDirectory(context.Background(), dir, "/t/takeout-001.zip",
 		func(string, string) (bool, error) { return false, nil },
 		func(j MigrationJob) { locked[filepath.Base(j.MediaPath)] = j.Locked },
 		zap.NewNop(),
@@ -182,7 +182,7 @@ func TestWalkDirectory_RecognisesVideosByContent(t *testing.T) {
 	}
 
 	got := map[string]MigrationJob{}
-	err := WalkDirectory(context.Background(), dir, "/t/takeout-001.zip",
+	_, err := WalkDirectory(context.Background(), dir, "/t/takeout-001.zip",
 		func(string, string) (bool, error) { return false, nil },
 		func(j MigrationJob) { got[filepath.Base(j.MediaPath)] = j },
 		zap.NewNop(),
@@ -220,5 +220,74 @@ func TestWalkDirectory_RecognisesVideosByContent(t *testing.T) {
 		if _, ok := got[name]; ok {
 			t.Errorf("%s was emitted; it is not an uploadable video", name)
 		}
+	}
+}
+
+// Break caught: files being dropped for an unknown reason, or the same file
+// classified differently by a run and by `scan --skipped`.
+func TestClassify(t *testing.T) {
+	jpeg := []byte{0xFF, 0xD8, 0xFF, 0xE0}
+	cases := []struct {
+		name string
+		head []byte
+		want Classification
+	}{
+		{"Trip/a.jpg", jpeg, Classification{}},
+		{"Trip/a.jpg.supplemental-metadata.json", nil, Classification{Skip: SkipMetadata}},
+		{"Trip/._a.jpg", jpeg, Classification{Skip: SkipAppleDouble}},
+		{"Trip/print-order.pdf", []byte("%PDF-1.4"), Classification{Skip: SkipNotMedia}},
+		{"Trip/test.h264", []byte{0, 0, 0, 1, 0x67, 0x64}, Classification{Skip: SkipNotMedia}},
+		{"Trip/notes", []byte("hello"), Classification{Skip: SkipNotMedia}},
+		{"Trip/PXL_a.MP", isoHeader("isom"), Classification{MotionPart: true}},
+		{"Trip/talk - 3.12.20", isoHeader("isom"), Classification{UploadName: "talk - 3.12.20.mp4", MimeType: "video/mp4"}},
+		{"Trip/still.bin", isoHeader("heic"), Classification{Skip: SkipNotMedia}},
+	}
+	for _, c := range cases {
+		head := c.head
+		got := Classify(c.name, func() []byte { return head })
+		if got != c.want {
+			t.Errorf("Classify(%q) = %+v, want %+v", c.name, got, c.want)
+		}
+	}
+}
+
+// Break caught: WalkDirectory not reporting what it skipped, so a run
+// cannot summarise skipped files per zip.
+func TestWalkDirectory_ReportsSkipped(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string][]byte{
+		"Trip/a.jpg":                            {0xFF, 0xD8, 0xFF, 0xE0},
+		"Trip/a.jpg.supplemental-metadata.json": []byte("{}"),
+		"Trip/._a.jpg":                          {0, 5, 22, 7},
+		"Trip/print-order.pdf":                  []byte("%PDF-1.4"),
+		"Trip/receipt.pdf":                      []byte("%PDF-1.4"),
+		"Trip/test.h264":                        {0, 0, 0, 1, 0x67},
+	}
+	for rel, b := range files {
+		p := filepath.Join(dir, "Takeout", "Google Photos", filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	skipped, err := WalkDirectory(context.Background(), dir, "",
+		func(string, string) (bool, error) { return false, nil },
+		func(MigrationJob) {}, zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := skipped.Count(SkipNotMedia); got != 3 {
+		t.Errorf("not-media skipped = %d, want 3", got)
+	}
+	if got := skipped.ByExt(SkipNotMedia); got != ".pdf ×2, .h264 ×1" {
+		t.Errorf("not-media by extension = %q, want \".pdf ×2, .h264 ×1\"", got)
+	}
+	if got := skipped.Count(SkipAppleDouble); got != 1 {
+		t.Errorf("AppleDouble skipped = %d, want 1", got)
+	}
+	if got := skipped.Count(SkipMetadata); got != 1 {
+		t.Errorf("metadata skipped = %d, want 1", got)
 	}
 }

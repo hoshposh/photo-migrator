@@ -35,23 +35,178 @@ var videoBrands = map[string][2]string{
 	"3g2a": {"video/3gpp2", ".3g2"},
 }
 
-// sniffVideo reports whether the file is an MP4/QuickTime-family video by
-// its content, returning its MIME type and usual extension.
-func sniffVideo(path string) (mime, ext string, ok bool) {
-	if strings.HasPrefix(filepath.Base(path), "._") || strings.EqualFold(filepath.Ext(path), ".json") {
-		return "", "", false
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return "", "", false
-	}
-	defer func() { _ = f.Close() }()
-	var b [12]byte
-	if _, err := io.ReadFull(f, b[:]); err != nil || string(b[4:8]) != "ftyp" {
+// videoFromHead reports whether a file's first bytes show an MP4/QuickTime
+// family video, returning its MIME type and usual extension.
+func videoFromHead(b []byte) (mime, ext string, ok bool) {
+	if len(b) < headLen || string(b[4:8]) != "ftyp" {
 		return "", "", false
 	}
 	v, ok := videoBrands[string(b[8:12])]
 	return v[0], v[1], ok
+}
+
+// SkipReason says why a file is not migrated ("" means it is).
+type SkipReason string
+
+const (
+	SkipNone        SkipReason = ""
+	SkipMetadata    SkipReason = "Takeout metadata (.json)"
+	SkipAppleDouble SkipReason = "macOS resource fork (._ file)"
+	SkipNotMedia    SkipReason = "not a recognised photo or video"
+)
+
+// Classification is the decision Classify makes for one file.
+type Classification struct {
+	Skip       SkipReason
+	MotionPart bool
+	UploadName string
+	MimeType   string
+}
+
+// Classify decides whether a file (a path on disk or an entry name inside a
+// zip) is migrated and how. head returns the file's first bytes; it is only
+// called when the name alone cannot decide (no media extension). Runs and
+// `scan --skipped` both use this, so they always agree.
+func Classify(name string, head func() []byte) Classification {
+	base := filepath.Base(filepath.FromSlash(name))
+	ext := strings.ToLower(filepath.Ext(base))
+	switch {
+	case strings.HasPrefix(base, "._"):
+		return Classification{Skip: SkipAppleDouble}
+	case ext == ".json":
+		return Classification{Skip: SkipMetadata}
+	case mediaExtensions[ext]:
+		return Classification{}
+	}
+	// Takeout exports some videos under names with no usable extension
+	// (motion-photo halves, "clip - 3.12.20"); recognise them by content.
+	if mime, vext, ok := videoFromHead(head()); ok {
+		if motionPartRe.MatchString(base) {
+			return Classification{MotionPart: true}
+		}
+		return Classification{UploadName: base + vext, MimeType: mime}
+	}
+	return Classification{Skip: SkipNotMedia}
+}
+
+// Skipped tallies files that were not migrated, by reason and extension.
+// The zero value is ready to use.
+type Skipped struct {
+	byExt    map[SkipReason]map[string]int
+	examples map[SkipReason][]string
+}
+
+// Add records one skipped file.
+func (s *Skipped) Add(r SkipReason, name string) {
+	if s.byExt == nil {
+		s.byExt = map[SkipReason]map[string]int{}
+		s.examples = map[SkipReason][]string{}
+	}
+	if s.byExt[r] == nil {
+		s.byExt[r] = map[string]int{}
+	}
+	base := filepath.Base(filepath.FromSlash(name))
+	ext := strings.ToLower(filepath.Ext(base))
+	if ext == "" {
+		ext = "(no extension)"
+	}
+	s.byExt[r][ext]++
+	if len(s.examples[r]) < 3 {
+		s.examples[r] = append(s.examples[r], base)
+	}
+}
+
+// Count returns how many files were skipped for reason r.
+func (s Skipped) Count(r SkipReason) int {
+	n := 0
+	for _, c := range s.byExt[r] {
+		n += c
+	}
+	return n
+}
+
+// ByExt summarises files skipped for reason r by extension, most common
+// first, e.g. ".pdf ×2, .h264 ×1".
+func (s Skipped) ByExt(r SkipReason) string {
+	type kv struct {
+		ext string
+		n   int
+	}
+	var list []kv
+	for e, n := range s.byExt[r] {
+		list = append(list, kv{e, n})
+	}
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].n != list[j].n {
+			return list[i].n > list[j].n
+		}
+		return list[i].ext < list[j].ext
+	})
+	parts := make([]string, len(list))
+	for i, x := range list {
+		parts[i] = fmt.Sprintf("%s ×%d", x.ext, x.n)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// Examples returns up to three file names skipped for reason r.
+func (s Skipped) Examples(r SkipReason) []string { return s.examples[r] }
+
+// ScanZip classifies every file in a zip without extracting it, reading only
+// the first bytes of entries whose name does not decide.
+func ScanZip(zipPath string, visit func(entry string, c Classification)) error {
+	r, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return fmt.Errorf("open zip %s: %w", zipPath, err)
+	}
+	defer func() { _ = r.Close() }()
+	for _, f := range r.File {
+		if f.FileInfo().IsDir() {
+			continue
+		}
+		visit(f.Name, Classify(f.Name, func() []byte { return zipHead(f) }))
+	}
+	return nil
+}
+
+// ScanDir classifies every file under dir (directory mode), visiting each
+// with its path relative to dir.
+func ScanDir(dir string, visit func(rel string, c Classification)) error {
+	return filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		rel, rerr := filepath.Rel(dir, path)
+		if rerr != nil {
+			rel = path
+		}
+		visit(filepath.ToSlash(rel), Classify(path, func() []byte { return fileHead(path) }))
+		return nil
+	})
+}
+
+const headLen = 12
+
+func fileHead(path string) []byte {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = f.Close() }()
+	b := make([]byte, headLen)
+	n, _ := io.ReadFull(f, b)
+	return b[:n]
+}
+
+func zipHead(f *zip.File) []byte {
+	rc, err := f.Open()
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = rc.Close() }()
+	b := make([]byte, headLen)
+	n, _ := io.ReadFull(rc, b)
+	return b[:n]
 }
 
 // LockedFolder is Takeout's folder for Google Photos' private, passcode-
@@ -231,8 +386,9 @@ func (c *ctxReader) Read(p []byte) (int, error) {
 }
 
 // WalkDirectory walks an extracted Takeout directory and calls emit for each
-// media file that has not already been uploaded. It stops and returns
-// ctx.Err() as soon as ctx is cancelled.
+// media file that has not already been uploaded, and returns a tally of the
+// files it did not migrate (see Classify). It stops and returns ctx.Err() as
+// soon as ctx is cancelled.
 //
 // isDone is called with each media file's path and zip entry (its path
 // relative to dir, which is the path inside the zip when sourceZip is set);
@@ -248,8 +404,9 @@ func WalkDirectory(
 	isDone func(path, zipEntry string) (bool, error),
 	emit func(MigrationJob),
 	logger *zap.Logger,
-) error {
-	return filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+) (Skipped, error) {
+	var skipped Skipped
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr // interrupted: stop walking
 		}
@@ -260,21 +417,10 @@ func WalkDirectory(
 		if d.IsDir() {
 			return nil
 		}
-		var motion bool
-		var uploadName, mime string
-		if !IsMediaFile(path) {
-			// Takeout exports some videos under names with no usable
-			// extension (motion-photo halves, "clip - 3.12.20"); recognise
-			// them by content.
-			vmime, vext, ok := sniffVideo(path)
-			if !ok {
-				return nil
-			}
-			if base := filepath.Base(path); motionPartRe.MatchString(base) {
-				motion = true
-			} else {
-				uploadName, mime = base+vext, vmime
-			}
+		c := Classify(path, func() []byte { return fileHead(path) })
+		if c.Skip != SkipNone {
+			skipped.Add(c.Skip, path)
+			return nil
 		}
 
 		zipEntry := ""
@@ -305,12 +451,13 @@ func WalkDirectory(
 			ZipEntry:    zipEntry,
 			Sidecar:     sidecar,
 			Locked:      topFolder(path, dir) == LockedFolder,
-			MotionPart:  motion,
-			UploadName:  uploadName,
-			MimeType:    mime,
+			MotionPart:  c.MotionPart,
+			UploadName:  c.UploadName,
+			MimeType:    c.MimeType,
 		})
 		return nil
 	})
+	return skipped, err
 }
 
 // albumFromPath derives the album name from a media file's location inside

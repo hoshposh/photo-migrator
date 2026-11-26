@@ -225,6 +225,10 @@ Prerequisites — see README.md for step-by-step instructions:
 // ─────────────────────────────────────────────────────────────
 
 func newScanCmd() *cobra.Command {
+	var (
+		skippedOnly bool
+		format      string
+	)
 	cmd := &cobra.Command{
 		Use:   "scan",
 		Short: "Discover zip archives and register them in the database",
@@ -235,12 +239,21 @@ Run this command after downloading new zip files from Google Takeout to
 register them ahead of the next 'run' invocation.
 
 In directory mode (no .zip files found), this command counts media files
-and reports the total without registering them individually.`,
+and reports the total without registering them individually.
+
+With --skipped it instead reports, read-only, every file a migration would
+NOT upload and why: not a recognised photo or video, a macOS ._ file, or
+Takeout's .json metadata. Zips are read in place (nothing is extracted) and
+the database is not opened, so it is safe to run on new downloads at any
+time, even while a migration is running.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			logger := buildLogger()
 			takeoutDir := viperPath("takeout-dir")
 			if takeoutDir == "" {
 				return fmt.Errorf("--takeout-dir is required (or set takeout-dir in config file)")
+			}
+			if skippedOnly {
+				return reportSkipped(takeoutDir, format)
 			}
 			st, err := store.Open(viperPath("db-path"))
 			if err != nil {
@@ -257,7 +270,109 @@ and reports the total without registering them individually.`,
 	}
 	cmd.Flags().String("takeout-dir", "",
 		"path to directory containing .zip files or a pre-extracted Takeout directory")
+	cmd.Flags().BoolVar(&skippedOnly, "skipped", false,
+		"report (read-only) the files a migration would not upload, and why")
+	cmd.Flags().StringVar(&format, "format", "text", "output format for --skipped: text | json")
 	return cmd
+}
+
+// skippedFile is one entry in the `scan --skipped` JSON report.
+type skippedFile struct {
+	Zip    string `json:"zip,omitempty"`
+	Entry  string `json:"entry"`
+	Reason string `json:"reason"`
+}
+
+// reportSkipped prints every file in the Takeout that a migration would not
+// upload, using the same takeout.Classify rule as a run. Read-only.
+func reportSkipped(takeoutDir, format string) error {
+	var (
+		tally              takeout.Skipped
+		list               []skippedFile
+		recognised, motion int
+		zips               []string
+	)
+	visit := func(zipName string) func(string, takeout.Classification) {
+		return func(entry string, c takeout.Classification) {
+			if c.Skip == takeout.SkipNone {
+				recognised++
+				if c.MotionPart {
+					motion++
+				}
+				return
+			}
+			tally.Add(c.Skip, entry)
+			if c.Skip != takeout.SkipMetadata {
+				list = append(list, skippedFile{Zip: zipName, Entry: entry, Reason: string(c.Skip)})
+			}
+		}
+	}
+
+	zipMode, err := takeout.IsZipMode(takeoutDir)
+	if err != nil {
+		return err
+	}
+	if zipMode {
+		if zips, err = takeout.ListZips(takeoutDir); err != nil {
+			return err
+		}
+		for _, z := range zips {
+			if err := takeout.ScanZip(z, visit(filepath.Base(z))); err != nil {
+				return err
+			}
+		}
+	} else if err := takeout.ScanDir(takeoutDir, visit("")); err != nil {
+		return err
+	}
+
+	summary := map[string]int{
+		"zips":                 len(zips),
+		"recognised_media":     recognised,
+		"motion_video_parts":   motion,
+		"not_media":            tally.Count(takeout.SkipNotMedia),
+		"macos_resource_forks": tally.Count(takeout.SkipAppleDouble),
+		"metadata_json":        tally.Count(takeout.SkipMetadata),
+	}
+	if format == "json" {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if list == nil {
+			list = []skippedFile{}
+		}
+		return enc.Encode(struct {
+			Summary map[string]int `json:"summary"`
+			Skipped []skippedFile  `json:"skipped"`
+		}{summary, list})
+	}
+
+	where := takeoutDir
+	if zipMode {
+		where = fmt.Sprintf("%s (%d zips, read in place)", takeoutDir, len(zips))
+	}
+	fmt.Printf("\n  Files a migration would not upload — %s\n\n", where)
+	if n := tally.Count(takeout.SkipNotMedia); n > 0 {
+		fmt.Printf("  ✗ Not a recognised photo or video: %d  (%s)\n", n, tally.ByExt(takeout.SkipNotMedia))
+		for _, f := range list {
+			if f.Reason == string(takeout.SkipNotMedia) {
+				if f.Zip != "" {
+					fmt.Printf("      %s  [%s]\n", f.Entry, f.Zip)
+				} else {
+					fmt.Printf("      %s\n", f.Entry)
+				}
+			}
+		}
+	} else {
+		fmt.Println("  ✓ Every file that is not metadata is a recognised photo or video.")
+	}
+	fmt.Printf("  · macOS resource forks (._ files): %d  (not photos; safe to ignore)\n", tally.Count(takeout.SkipAppleDouble))
+	fmt.Printf("  · Takeout metadata (.json): %d  (read for dates and locations, not uploaded)\n", tally.Count(takeout.SkipMetadata))
+	fmt.Printf("\n  Recognised photos and videos: %d", recognised)
+	if motion > 0 {
+		fmt.Printf("  (%d are motion-photo video parts, which 'run' holds back: see 'photo-migrator motion-videos')", motion)
+	}
+	fmt.Println()
+	fmt.Println()
+	return nil
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1064,6 +1179,7 @@ func interrupted(ctx context.Context, zipPath string, setZipStatus func(string, 
 func processDirectory(ctx context.Context, dir, sourceZip string, st *store.Store, pool *pipeline.Pool, logger *zap.Logger) error {
 	jobs := make(chan pipeline.Job, 200)
 	walkErr := make(chan error, 1)
+	var skipped takeout.Skipped // written by the walker before it sends on walkErr
 
 	// The walker gets its own context so it can be released if the pool
 	// stops early (fatal error) and nothing is left to drain the channel.
@@ -1072,7 +1188,8 @@ func processDirectory(ctx context.Context, dir, sourceZip string, st *store.Stor
 
 	go func() {
 		defer close(jobs)
-		err := takeout.WalkDirectory(walkCtx, dir, sourceZip, func(path, zipEntry string) (bool, error) {
+		var err error
+		skipped, err = takeout.WalkDirectory(walkCtx, dir, sourceZip, func(path, zipEntry string) (bool, error) {
 			return st.IsDone(sourceZip, zipEntry, path)
 		}, func(j takeout.MigrationJob) {
 			// Locked Folder files are private: hold them back unless a review
@@ -1137,7 +1254,28 @@ func processDirectory(ctx context.Context, dir, sourceZip string, st *store.Stor
 	case werr != nil:
 		return fmt.Errorf("walk directory: %w", werr)
 	}
+	logSkipped(skipped, sourceZip, dir, logger)
 	return nil
+}
+
+// logSkipped writes one summary line per walked zip (or directory) for files
+// that were not migrated, so nothing is skipped without a trace. Takeout's
+// .json metadata files are expected and not reported.
+func logSkipped(s takeout.Skipped, sourceZip, dir string, logger *zap.Logger) {
+	where := zap.String("zip", filepath.Base(sourceZip))
+	if sourceZip == "" {
+		where = zap.String("dir", dir)
+	}
+	if n := s.Count(takeout.SkipNotMedia); n > 0 {
+		logger.Warn(fmt.Sprintf("skipped %d file(s) not recognised as photos or videos (list them: photo-migrator scan --skipped)", n),
+			where,
+			zap.String("types", s.ByExt(takeout.SkipNotMedia)),
+			zap.Strings("examples", s.Examples(takeout.SkipNotMedia)),
+		)
+	}
+	if n := s.Count(takeout.SkipAppleDouble); n > 0 {
+		logger.Info(fmt.Sprintf("ignored %d macOS resource-fork (._) file(s); they are not photos", n), where)
+	}
 }
 
 // runDirMode walks a pre-extracted directory and uploads everything.
