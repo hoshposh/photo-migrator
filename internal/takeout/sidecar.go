@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // EpochTime is a Google Takeout timestamp field.
@@ -104,23 +106,43 @@ var nonSidecarJSON = map[string]bool{
 // Returns ("", nil, nil) when no sidecar exists — not treated as an error.
 func FindSidecar(mediaPath string) (string, *Sidecar, error) {
 	dir := filepath.Dir(mediaPath)
-	base := filepath.Base(mediaPath)
+	name, s := findSidecar(filepath.Base(mediaPath),
+		func(name string) (*Sidecar, error) { return parseSidecar(filepath.Join(dir, name)) },
+		func() []string {
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				return nil // can't read dir — not fatal
+			}
+			names := make([]string, 0, len(entries))
+			for _, e := range entries {
+				if !e.IsDir() {
+					names = append(names, e.Name())
+				}
+			}
+			return names
+		})
+	if s == nil {
+		return "", nil, nil // no sidecar found
+	}
+	return filepath.Join(dir, name), s, nil
+}
 
+// findSidecar applies FindSidecar's four strategies to one folder. parse opens
+// a JSON file in that folder by name; list returns the folder's file names and
+// is only called if strategies 1–2 miss.
+func findSidecar(base string, parse func(name string) (*Sidecar, error), list func() []string) (name string, s *Sidecar) {
 	// Strategy 1: exact supplemental-metadata.json (most common for short names)
-	if s, err := parseSidecar(filepath.Join(dir, base+".supplemental-metadata.json")); err == nil {
-		return filepath.Join(dir, base+".supplemental-metadata.json"), s, nil
+	if s, err := parse(base + ".supplemental-metadata.json"); err == nil {
+		return base + ".supplemental-metadata.json", s
 	}
 
 	// Strategy 2: exact legacy .json (BURST photos, older exports)
-	if s, err := parseSidecar(filepath.Join(dir, base+".json")); err == nil {
-		return filepath.Join(dir, base+".json"), s, nil
+	if s, err := parse(base + ".json"); err == nil {
+		return base + ".json", s
 	}
 
-	// Read directory once for strategies 3 and 4.
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return "", nil, nil // can't read dir — not fatal
-	}
+	// List the folder once for strategies 3 and 4.
+	names := list()
 
 	// Strategy 3: any .json sibling whose name starts with "<base>." —
 	// this matches ALL truncated supplemental-metadata variants in one check:
@@ -128,34 +150,46 @@ func FindSidecar(mediaPath string) (string, *Sidecar, error) {
 	//   <base>.supplemental-me.json
 	//   <base>.supplement.json  etc.
 	prefix := base + "."
-	for _, e := range entries {
-		if e.IsDir() || nonSidecarJSON[e.Name()] {
+	for _, n := range names {
+		if nonSidecarJSON[n] || !strings.HasSuffix(n, ".json") {
 			continue
 		}
-		if !strings.HasSuffix(e.Name(), ".json") {
-			continue
-		}
-		if strings.HasPrefix(e.Name(), prefix) {
-			candidate := filepath.Join(dir, e.Name())
-			if s, err := parseSidecar(candidate); err == nil {
-				return candidate, s, nil
+		if strings.HasPrefix(n, prefix) {
+			if s, err := parse(n); err == nil {
+				return n, s
 			}
 		}
 	}
 
 	// Strategy 4: title-field fallback — parse every non-excluded .json in the
 	// same directory and compare the "title" field to the media basename.
-	for _, e := range entries {
-		if e.IsDir() || nonSidecarJSON[e.Name()] || !strings.HasSuffix(e.Name(), ".json") {
+	for _, n := range names {
+		if nonSidecarJSON[n] || !strings.HasSuffix(n, ".json") {
 			continue
 		}
-		candidate := filepath.Join(dir, e.Name())
-		if s, err := parseSidecar(candidate); err == nil && s.Title == base {
-			return candidate, s, nil
+		if s, err := parse(n); err == nil && s.Title == base {
+			return n, s
 		}
 	}
 
-	return "", nil, nil // no sidecar found
+	return "", nil
+}
+
+// TakenTime is the date the photo was taken: photoTakenTime, else creationTime,
+// as UTC. ok is false when s is nil or neither holds a positive Unix time.
+func (s *Sidecar) TakenTime() (t time.Time, ok bool) {
+	if s == nil {
+		return time.Time{}, false
+	}
+	ts := s.PhotoTakenTime.Timestamp
+	if ts == "" || ts == "0" {
+		ts = s.CreationTime.Timestamp
+	}
+	epoch, err := strconv.ParseInt(ts, 10, 64)
+	if err != nil || epoch <= 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(epoch, 0).UTC(), true
 }
 
 // parseSidecar opens and decodes a JSON sidecar file.

@@ -9,9 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
-	"time"
 
 	"github.com/hoshposh/photo-migrator/internal/takeout"
 )
@@ -44,30 +42,19 @@ func RestoreMetadata(mediaPath string, sidecar *takeout.Sidecar) error {
 
 	args := []string{"-overwrite_original"}
 
-	// Date/time: prefer photoTakenTime, fall back to creationTime.
-	ts := sidecar.PhotoTakenTime
-	if ts.Timestamp == "" || ts.Timestamp == "0" {
-		ts = sidecar.CreationTime
-	}
-	if ts.Timestamp != "" && ts.Timestamp != "0" {
-		epoch, err := strconv.ParseInt(ts.Timestamp, 10, 64)
-		if err != nil {
-			return fmt.Errorf("parse timestamp %q: %w", ts.Timestamp, err)
-		}
-		if epoch > 0 {
-			t := time.Unix(epoch, 0).UTC()
-			exifDate := t.Format("2006:01:02 15:04:05")
-			args = append(args,
-				"-DateTimeOriginal="+exifDate,
-				"-CreateDate="+exifDate,
-				"-ModifyDate="+exifDate,
-				// EXIF 2.31 timezone offset tags — marks dates as UTC so
-				// Google Photos won't misinterpret them as local time.
-				"-OffsetTimeOriginal=+00:00",
-				"-OffsetTimeDigitized=+00:00",
-				"-OffsetTime=+00:00",
-			)
-		}
+	// Date/time: photoTakenTime, falling back to creationTime.
+	if t, ok := sidecar.TakenTime(); ok {
+		exifDate := t.Format("2006:01:02 15:04:05")
+		args = append(args,
+			"-DateTimeOriginal="+exifDate,
+			"-CreateDate="+exifDate,
+			"-ModifyDate="+exifDate,
+			// EXIF 2.31 timezone offset tags — marks dates as UTC so
+			// Google Photos won't misinterpret them as local time.
+			"-OffsetTimeOriginal=+00:00",
+			"-OffsetTimeDigitized=+00:00",
+			"-OffsetTime=+00:00",
+		)
 	}
 
 	// GPS: prefer geoDataExif, fall back to geoData.
