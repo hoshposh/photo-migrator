@@ -131,6 +131,9 @@ func initConfig(cmd *cobra.Command) error {
 
 	// Allow env overrides: PHOTO_MIGRATOR_DB_PATH, etc.
 	viper.SetEnvPrefix("PHOTO_MIGRATOR")
+	// Keys are kebab-case ("takeout-dir"); environment variables can't contain
+	// "-", so look them up as PHOTO_MIGRATOR_TAKEOUT_DIR.
+	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
 	viper.AutomaticEnv()
 
 	// Silently ignore "file not found" — the config file is optional.

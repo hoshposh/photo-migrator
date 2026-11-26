@@ -1964,3 +1964,50 @@ func TestRunUpload_HoldsBackLivePhotoVideo(t *testing.T) {
 		t.Errorf("uploads = %v, want the still and the standalone video only", up)
 	}
 }
+
+// Break caught: PHOTO_MIGRATOR_<KEY> variables being ignored for hyphenated
+// keys (takeout-dir, db-path), because viper looked up
+// "PHOTO_MIGRATOR_TAKEOUT-DIR" instead of "PHOTO_MIGRATOR_TAKEOUT_DIR".
+func TestEnvVars_HyphenatedKeys(t *testing.T) {
+	takeoutDir := t.TempDir()
+	zipPath := writeTakeoutZip(t, takeoutDir, "takeout-001.zip")
+	dbPath := filepath.Join(t.TempDir(), "m.db")
+	t.Setenv("PHOTO_MIGRATOR_TAKEOUT_DIR", takeoutDir)
+	t.Setenv("PHOTO_MIGRATOR_DB_PATH", dbPath)
+
+	if err := execute(t, "scan"); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if got := pendingZips(t, dbPath); len(got) != 1 || got[0] != zipPath {
+		t.Fatalf("registered zips = %v, want [%s]", got, zipPath)
+	}
+}
+
+// The documented order: CLI flag > environment variable > config file.
+func TestEnvVars_Precedence(t *testing.T) {
+	fromConfig, fromEnv, fromFlag := t.TempDir(), t.TempDir(), t.TempDir()
+	writeTakeoutZip(t, fromConfig, "takeout-config.zip")
+	envZip := writeTakeoutZip(t, fromEnv, "takeout-env.zip")
+	flagZip := writeTakeoutZip(t, fromFlag, "takeout-flag.zip")
+	cfg := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(cfg, []byte("takeout-dir = \""+fromConfig+"\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PHOTO_MIGRATOR_TAKEOUT_DIR", fromEnv)
+
+	dbEnv := filepath.Join(t.TempDir(), "env.db")
+	if err := execute(t, "scan", "--config", cfg, "--db-path", dbEnv); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if got := pendingZips(t, dbEnv); len(got) != 1 || got[0] != envZip {
+		t.Errorf("env should beat the config file: registered %v, want [%s]", got, envZip)
+	}
+
+	dbFlag := filepath.Join(t.TempDir(), "flag.db")
+	if err := execute(t, "scan", "--config", cfg, "--db-path", dbFlag, "--takeout-dir", fromFlag); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if got := pendingZips(t, dbFlag); len(got) != 1 || got[0] != flagZip {
+		t.Errorf("the flag should beat env: registered %v, want [%s]", got, flagZip)
+	}
+}
