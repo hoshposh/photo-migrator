@@ -10,6 +10,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/hoshposh/photo-migrator/internal/photos"
+	"github.com/hoshposh/photo-migrator/internal/store"
 )
 
 // Defaults for Config.BatchSize and Config.BatchDelay.
@@ -151,6 +152,13 @@ func (b *batcher) send(albumID string, group []uploaded) {
 			if err := b.p.store.SetMediaComplete(u.job.MediaPath, r.MediaItemID); err != nil {
 				u.log.Error("mark complete", zap.Error(err))
 				continue
+			}
+			if !r.CreationTime.IsZero() {
+				// Best effort: the date never changes what happens to the upload.
+				g := []store.GoogleDate{{MediaID: r.MediaItemID, Time: r.CreationTime}}
+				if err := b.p.store.SetGoogleDates(g, time.Now()); err != nil {
+					u.log.Debug("record Google date", zap.Error(err))
+				}
 			}
 			u.log.Info("✓ uploaded", zap.String("mediaID", r.MediaItemID))
 		}

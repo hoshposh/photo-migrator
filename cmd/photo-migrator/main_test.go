@@ -1313,7 +1313,10 @@ func echoBatchCreate(w http.ResponseWriter, r *http.Request, fail map[string]str
 		UploadToken string `json:"uploadToken"`
 		Status      status `json:"status"`
 		MediaItem   *struct {
-			ID string `json:"id"`
+			ID            string `json:"id"`
+			MediaMetadata struct {
+				CreationTime string `json:"creationTime"`
+			} `json:"mediaMetadata"`
 		} `json:"mediaItem,omitempty"`
 	}
 	var out struct {
@@ -1327,8 +1330,12 @@ func echoBatchCreate(w http.ResponseWriter, r *http.Request, fail map[string]str
 		}
 		res := result{UploadToken: tok}
 		res.MediaItem = &struct {
-			ID string `json:"id"`
+			ID            string `json:"id"`
+			MediaMetadata struct {
+				CreationTime string `json:"creationTime"`
+			} `json:"mediaMetadata"`
 		}{ID: "m-" + tok}
+		res.MediaItem.MediaMetadata.CreationTime = "2026-07-03T09:41:00Z"
 		out.NewMediaItemResults = append(out.NewMediaItemResults, res)
 	}
 	_ = json.NewEncoder(w).Encode(out)
@@ -1579,5 +1586,45 @@ func TestProcessZips_RawPairs(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Both dates are recorded as files are uploaded: the sidecar's taken time
+// when the file has one, and the creation time Google reports.
+func TestProcessZips_RecordsDates(t *testing.T) {
+	fx := &batchFixture{}
+	st := fx.run(t, map[string]string{
+		"Takeout/Google Photos/Trip/a.jpg":                            "\xff\xd8\xff\xe0a",
+		"Takeout/Google Photos/Trip/a.jpg.supplemental-metadata.json": `{"title":"a.jpg","photoTakenTime":{"timestamp":"1560535320"}}`,
+		"Takeout/Google Photos/Trip/b.jpg":                            "\xff\xd8\xff\xe0b",
+	})
+	rows, err := st.GetDateRows()
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]store.DateRow{}
+	for _, r := range rows {
+		byName[filepath.Base(r.ZipEntry)] = r
+	}
+	wantGoogle := time.Date(2026, 7, 3, 9, 41, 0, 0, time.UTC)
+	a, ok := byName["a.jpg"]
+	if !ok {
+		t.Fatalf("no row for a.jpg in %+v", rows)
+	}
+	if a.TakenSource != "sidecar" || !a.TakenTime.Equal(time.Date(2019, 6, 14, 18, 2, 0, 0, time.UTC)) {
+		t.Errorf("a taken = %q %v", a.TakenSource, a.TakenTime)
+	}
+	if !a.GoogleTime.Equal(wantGoogle) || a.GoogleCheckedAt.IsZero() {
+		t.Errorf("a google = %v checked %v", a.GoogleTime, a.GoogleCheckedAt)
+	}
+	b, ok := byName["b.jpg"]
+	if !ok {
+		t.Fatalf("no row for b.jpg in %+v", rows)
+	}
+	if b.TakenSource != "" {
+		t.Errorf("b taken source = %q, want none recorded", b.TakenSource)
+	}
+	if !b.GoogleTime.Equal(wantGoogle) {
+		t.Errorf("b google = %v", b.GoogleTime)
 	}
 }

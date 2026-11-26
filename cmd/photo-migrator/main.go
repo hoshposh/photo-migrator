@@ -1291,6 +1291,13 @@ func processDirectory(ctx context.Context, dir, sourceZip string, st *store.Stor
 				if err := st.RegisterMedia(j.MediaPath, j.SourceZip, j.ZipEntry, j.AlbumName); err != nil {
 					logger.Warn("register media", zap.String("path", j.MediaPath), zap.Error(err))
 				}
+				// Remember the date the sidecar says the photo was taken, to
+				// compare with Google's later. Best effort: never affects the upload.
+				if t, ok := j.Sidecar.TakenTime(); ok {
+					if err := st.SetTakenDates([]store.TakenDate{{SourcePath: j.MediaPath, Time: t}}); err != nil {
+						logger.Debug("record taken date", zap.String("path", j.MediaPath), zap.Error(err))
+					}
+				}
 			}
 			select {
 			case jobs <- pipeline.Job{MigrationJob: j}:
