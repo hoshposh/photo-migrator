@@ -15,11 +15,13 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
+	"golang.org/x/oauth2"
 
 	"github.com/hoshposh/photo-migrator/internal/photos"
 	"github.com/hoshposh/photo-migrator/internal/store"
@@ -578,6 +580,73 @@ func TestWrongDates_FailedChunkIsSkipped(t *testing.T) {
 	}
 	if !strings.Contains(out, "50 not checked yet") {
 		t.Errorf("report lacks the not-checked count:\n%s", out)
+	}
+}
+
+// Break caught: a persistent failure being retried for every chunk (hours
+// for a large library) instead of stopping, or a success not resetting the count.
+func TestWrongDates_StopsAfterThreeFailedChunks(t *testing.T) {
+	f := newWDFixture(t)
+	f.addZip("takeout-001.zip", map[string]string{"x.txt": "x"})
+	for i := 0; i < 200; i++ {
+		f.upload("takeout-001.zip", fmt.Sprintf("%sp%03d.jpg", wdTrip, i), "Trip", fmt.Sprintf("m-%03d", i))
+	}
+	f.onReq = func(_ int, w http.ResponseWriter, _ *http.Request) bool {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return true
+	}
+
+	_, _, err := f.run(context.Background(), wrongDatesOpts{}, nil)
+	if err == nil || !strings.Contains(err.Error(), "3 failed batches") {
+		t.Fatalf("err = %v, want a stop after 3 failed batches", err)
+	}
+	if n := f.requestCount(); n != 3 {
+		t.Errorf("%d batchGet requests, want 3", n)
+	}
+	for entry, r := range f.rows() {
+		if !r.GoogleCheckedAt.IsZero() {
+			t.Errorf("%s was stored", entry)
+		}
+	}
+}
+
+// Break caught: a rejected sign-in treated as a failed chunk, giving hundreds
+// of warnings and exit 0 instead of telling the user to sign in again.
+func TestWrongDates_RejectedSignInIsFatal(t *testing.T) {
+	f := newWDFixture(t)
+	f.addZip("takeout-001.zip", map[string]string{"x.txt": "x"})
+	for i := 0; i < 120; i++ {
+		f.upload("takeout-001.zip", fmt.Sprintf("%sp%03d.jpg", wdTrip, i), "Trip", fmt.Sprintf("m-%03d", i))
+	}
+	var apiCalls atomic.Int32
+	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"invalid_grant","error_description":"Bad Request"}`))
+			return
+		}
+		apiCalls.Add(1)
+		http.NotFound(w, r)
+	}))
+	defer tokenSrv.Close()
+	target, _ := url.Parse(tokenSrv.URL)
+	ctx := context.WithValue(context.Background(), oauth2.HTTPClient, &http.Client{Transport: rewriteTransport{target}})
+	cfg := &oauth2.Config{ClientID: "id", ClientSecret: "secret", Endpoint: oauth2.Endpoint{TokenURL: "https://oauth2.example/token"}}
+	expired := &oauth2.Token{AccessToken: "old", RefreshToken: "revoked", Expiry: time.Now().Add(-time.Hour)}
+	client := photos.New(cfg.Client(ctx, expired))
+
+	_, _, err := f.run(context.Background(), wrongDatesOpts{}, func() (*photos.Client, error) { return client, nil })
+	if !errors.Is(err, photos.ErrAuthFailed) {
+		t.Fatalf("err = %v, want photos.ErrAuthFailed", err)
+	}
+	if f.logs.Len() != 0 {
+		t.Errorf("a rejected sign-in must not be logged as skipped chunks: %v", f.logs.All())
+	}
+	for entry, r := range f.rows() {
+		if !r.GoogleCheckedAt.IsZero() {
+			t.Errorf("%s was stored", entry)
+		}
 	}
 }
 

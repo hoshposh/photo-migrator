@@ -283,7 +283,8 @@ func fillGoogleDates(ctx context.Context, st *store.Store, rows []store.DateRow,
 	}
 	ctx = photos.WithLogger(ctx, logger)
 
-	checked, shown := 0, -1
+	const maxFailedChunks = 3 // consecutive, so an outage does not retry every chunk
+	checked, shown, failedRun := 0, -1, 0
 	progress := func() {
 		shown = checked
 		_, _ = fmt.Fprintf(errOut, "checked %s / %s\n", withCommas(checked), withCommas(len(ids)))
@@ -295,13 +296,20 @@ func fillGoogleDates(ctx context.Context, st *store.Store, rows []store.DateRow,
 		case errors.Is(err, photos.ErrInsufficientScope):
 			return fmt.Errorf("cannot read photo dates from Google: the saved sign-in lacks the "+
 				"permission %s. Add it on the OAuth consent screen (Scopes), then run: photo-migrator auth: %w", readScope, err)
+		case errors.Is(err, photos.ErrAuthFailed):
+			return err
 		case ctx.Err() != nil:
 			return ctx.Err()
 		case err != nil:
 			logger.Warn("could not read a batch of photo dates; they stay unchecked until the next run",
 				zap.Int("photos", end-start), zap.Error(err))
+			if failedRun++; failedRun >= maxFailedChunks {
+				return fmt.Errorf("stopping after %d failed batches in a row (%d photo dates were saved; run again to continue): %w",
+					failedRun, checked, err)
+			}
 			continue
 		}
+		failedRun = 0
 		var got []store.GoogleDate
 		for _, d := range res {
 			if !d.Missing && d.CreationTime.IsZero() {
