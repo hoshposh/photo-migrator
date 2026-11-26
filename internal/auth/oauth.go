@@ -143,7 +143,8 @@ func runLoopbackFlow(ctx context.Context, cfg *oauth2.Config) (*oauth2.Token, er
 	defer srv.Shutdown(context.Background()) //nolint:errcheck
 
 	authURL := cfg.AuthCodeURL(state, oauth2.AccessTypeOffline, oauth2.S256ChallengeOption(verifier))
-	fmt.Println("\nOpening browser for Google Photos authorization (Account B)...")
+	fmt.Println("\nOpening browser to sign in to the destination Google Photos account...")
+	fmt.Println("Sign in with the account you are migrating TO, not the one the Takeout came from.")
 	fmt.Println("If the browser does not open automatically, visit this URL:")
 	fmt.Println(" ", authURL)
 	openBrowser(authURL)

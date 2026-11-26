@@ -183,11 +183,14 @@ func newAuthCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "auth",
 		Short: "Authenticate with the destination Google Photos account",
-		Long: `Runs a one-time OAuth2 authorization flow for the destination account
-(Account B). A browser window will open to complete the sign-in.
+		Long: `Signs in to the destination Google Photos account: the account your photos
+are migrated to, not the one the Takeout archive came from. A browser window
+will open to complete the sign-in.
 
 The resulting token is cached at ~/.config/photo-migrator/token.json and
-reused (with automatic refresh) by subsequent commands.
+reused (with automatic refresh) by subsequent commands. Run auth again at any
+time to replace it, for example when a run stops because Google rejected the
+saved sign-in.
 
 Prerequisites — see README.md for step-by-step instructions:
   1. Create a Google Cloud project and enable the Photos Library API.
