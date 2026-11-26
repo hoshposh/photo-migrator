@@ -301,6 +301,14 @@ You can then open [photos.google.com](https://photos.google.com/), click
 
 ---
 
+## Motion photos and videos with unusual names
+
+Takeout exports a motion photo (e.g. from a Pixel phone) as two files: the still image (`PXL_x.MP.jpg` or `PXL_x.RAW-01.MP.COVER.jpg`) and its video (`PXL_x.MP`, `PXL_x.MP~2` or `PXL_x.RAW-01.MP.COVER`). The still may be in a different zip from its video. The still is uploaded as a normal photo. The Google Photos API cannot rebuild a motion photo, though, so its video would appear as a separate video next to the still. These videos are therefore **held back** with status `motion_video`; `status` counts them and `motion-videos` lists them (`--extract <dir>` pulls them out).
+
+Other videos whose names don't end in a known extension (for example `Concert - 3.12.20`) are recognised by their content and uploaded with a matching extension added (`Concert - 3.12.20.mp4`).
+
+---
+
 ## Locked Folder files are held back
 
 Photos and videos from your Google Photos **Locked Folder** are private, and the Google Photos API cannot add files to the destination account's Locked Folder. Uploading them would put them in the main library, visible on every device. So `run` **does not upload them**: they are recorded with status `locked`, they don't stop their zip from completing, and `status` shows how many there are.
@@ -361,6 +369,7 @@ photo-migrator large-files --format json       # machine-readable JSON report
 photo-migrator large-files --extract <dir>     # re-extract oversized files for manual upload
 photo-migrator locked-files                    # list Locked Folder files held back from upload
 photo-migrator locked-files --extract <dir>    # extract them to handle by hand
+photo-migrator motion-videos                   # list motion-photo video parts held back from upload
 ```
 
 Flags in brackets are optional if set in the config file. Use `--help` on any command for full flag documentation.

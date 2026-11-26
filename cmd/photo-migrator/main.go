@@ -104,6 +104,7 @@ Quick start:
 		newStatusCmd(),
 		newLargeFilesCmd(),
 		newLockedFilesCmd(),
+		newMotionVideosCmd(),
 		newConfigCmd(),
 	)
 	return root
@@ -435,6 +436,9 @@ func newStatusCmd() *cobra.Command {
 			if stats.LockedMedia > 0 {
 				fmt.Printf("       🔒 held back %d  (Locked Folder, not uploaded: see 'photo-migrator locked-files')\n", stats.LockedMedia)
 			}
+			if stats.MotionMedia > 0 {
+				fmt.Printf("       🎞 motion    %d  (motion-photo videos, not uploaded: see 'photo-migrator motion-videos')\n", stats.MotionMedia)
+			}
 			fmt.Printf("  🗂   Albums         %d / %d created\n", stats.CompleteAlbums, stats.TotalAlbums)
 
 			if stats.TotalZips > 0 {
@@ -529,6 +533,30 @@ Flags:
 			"  account, then use \"Move to Locked Folder\" in the Google Photos mobile app.",
 		},
 		query: (*store.Store).GetLockedFiles,
+	})
+}
+
+func newMotionVideosCmd() *cobra.Command {
+	return newManualFilesCmd(manualReport{
+		use:   "motion-videos",
+		short: "List motion-photo video parts held back from upload",
+		long: `Lists the video halves of motion photos (for example PXL_x.MP or
+PXL_x.MP.COVER, exported next to the still image PXL_x.MP.jpg). The still
+image is uploaded as a normal photo, but the Google Photos API cannot rebuild
+a motion photo: its video would appear as a separate video next to the
+still. So photo-migrator holds these videos back.
+
+Flags:
+  --format json    Emit machine-readable JSON instead of a text table
+  --extract <dir>  Extract the videos from their source zips into <dir>`,
+		extractHelp: "extract the motion-photo videos from their source zips into this directory",
+		empty:       "  ✓ No motion-photo videos are being held back.",
+		title:       "🎞  Motion photos — %d video part(s) held back (the still images were uploaded)",
+		advice: []string{
+			"  The Google Photos API cannot rebuild motion photos; uploading these would",
+			"  add each as a separate video next to its still image.",
+		},
+		query: (*store.Store).GetMotionVideos,
 	})
 }
 
@@ -1054,13 +1082,30 @@ func processDirectory(ctx context.Context, dir, sourceZip string, st *store.Stor
 					logger.Info("dry-run: Locked Folder file would be held back", zap.String("file", filepath.Base(j.MediaPath)))
 					return
 				}
-				held, err := st.RegisterLocked(j.MediaPath, j.SourceZip, j.ZipEntry)
+				held, err := st.RegisterHeld(store.StatusLocked, j.MediaPath, j.SourceZip, j.ZipEntry)
 				if err != nil {
 					logger.Warn("register locked file", zap.String("path", j.MediaPath), zap.Error(err))
 					return // never upload a Locked Folder file we could not record
 				}
 				if held {
 					logger.Info("held back: Locked Folder file not uploaded (see 'photo-migrator locked-files')",
+						zap.String("file", filepath.Base(j.MediaPath)))
+					return
+				}
+			} else if j.MotionPart {
+				// The API cannot rebuild a motion photo: its video half would
+				// become a separate video. Hold it back unless released.
+				if pool.DryRun() {
+					logger.Info("dry-run: motion-photo video would be held back", zap.String("file", filepath.Base(j.MediaPath)))
+					return
+				}
+				held, err := st.RegisterHeld(store.StatusMotionVideo, j.MediaPath, j.SourceZip, j.ZipEntry)
+				if err != nil {
+					logger.Warn("register motion video", zap.String("path", j.MediaPath), zap.Error(err))
+					return
+				}
+				if held {
+					logger.Info("held back: motion-photo video not uploaded (see 'photo-migrator motion-videos')",
 						zap.String("file", filepath.Base(j.MediaPath)))
 					return
 				}

@@ -154,7 +154,7 @@ func (p *Pool) process(ctx context.Context, job Job, stop func(error)) {
 	// Two-step upload: byte stream → batchCreate. From here the upload is in
 	// flight, so an interrupt (Ctrl+C) lets it finish rather than aborting it
 	// and recording a spurious failure. A second Ctrl+C exits the process.
-	mediaID, err := p.client.UploadMedia(context.WithoutCancel(ctx), job.MediaPath, description, albumID)
+	mediaID, err := p.client.UploadMedia(context.WithoutCancel(ctx), job.MediaPath, job.UploadName, job.MimeType, description, albumID)
 	if err != nil {
 		if errors.Is(err, photos.ErrAuthFailed) {
 			stop(err) // not this file's fault: leave pending, stop the run

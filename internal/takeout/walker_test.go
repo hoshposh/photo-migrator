@@ -146,3 +146,79 @@ func TestWalkDirectory_FlagsLockedFolderFiles(t *testing.T) {
 		t.Errorf("Locked flags = %v, want s.jpg locked and t.jpg not", locked)
 	}
 }
+
+// isoHeader returns the first bytes of an ISO base-media file (MP4/MOV/HEIC)
+// with the given 4-character brand.
+func isoHeader(brand string) []byte {
+	return append([]byte{0, 0, 0, 0x20, 'f', 't', 'y', 'p'}, []byte(brand+"\x00\x00\x02\x00rest-of-file")...)
+}
+
+// Break caught: videos Takeout exports under unrecognised names being
+// skipped silently (e.g. a video named "... 3.12.20"), motion-photo video
+// halves (PXL_x.MP, PXL_x.MP.COVER) not being told apart from standalone
+// videos, or non-video files with unknown extensions being uploaded.
+func TestWalkDirectory_RecognisesVideosByContent(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string][]byte{
+		"Photos from 2020/talk - 3.12.20":            isoHeader("isom"),
+		"Photos from 2022/PXL_a.MP":                  isoHeader("isom"),
+		"Photos from 2022/PXL_a.MP.jpg":              {0xFF, 0xD8, 0xFF, 0xE0},
+		"Photos from 2022/PXL_b.MP~2":                isoHeader("mp42"),
+		"Photos from 2024/PXL_c.RAW-01.MP.COVER":     isoHeader("mp42"),
+		"Photos from 2024/PXL_c.RAW-01.MP.COVER.jpg": {0xFF, 0xD8, 0xFF, 0xE0},
+		"Photos from 2019/old clip.20":               isoHeader("qt  "),
+		"Photos from 2019/print-order.pdf":           []byte("%PDF-1.4"),
+		"Photos from 2019/test.h264":                 {0, 0, 0, 1, 0x67, 0x64},
+		"Photos from 2019/not-a-video.bin":           isoHeader("heic"),
+	}
+	for rel, b := range files {
+		p := filepath.Join(dir, "Takeout", "Google Photos", filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got := map[string]MigrationJob{}
+	err := WalkDirectory(context.Background(), dir, "/t/takeout-001.zip",
+		func(string, string) (bool, error) { return false, nil },
+		func(j MigrationJob) { got[filepath.Base(j.MediaPath)] = j },
+		zap.NewNop(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type want struct {
+		motion     bool
+		uploadName string
+		mime       string
+	}
+	wants := map[string]want{
+		"talk - 3.12.20":            {false, "talk - 3.12.20.mp4", "video/mp4"},
+		"old clip.20":               {false, "old clip.20.mov", "video/quicktime"},
+		"PXL_a.MP":                  {true, "", ""},
+		"PXL_b.MP~2":                {true, "", ""},
+		"PXL_c.RAW-01.MP.COVER":     {true, "", ""},
+		"PXL_a.MP.jpg":              {false, "", ""},
+		"PXL_c.RAW-01.MP.COVER.jpg": {false, "", ""},
+	}
+	for name, w := range wants {
+		j, ok := got[name]
+		if !ok {
+			t.Errorf("%s was not emitted", name)
+			continue
+		}
+		if j.MotionPart != w.motion || j.UploadName != w.uploadName || j.MimeType != w.mime {
+			t.Errorf("%s: MotionPart=%v UploadName=%q MimeType=%q, want %v %q %q",
+				name, j.MotionPart, j.UploadName, j.MimeType, w.motion, w.uploadName, w.mime)
+		}
+	}
+	for _, name := range []string{"print-order.pdf", "test.h264", "not-a-video.bin"} {
+		if _, ok := got[name]; ok {
+			t.Errorf("%s was emitted; it is not an uploadable video", name)
+		}
+	}
+}

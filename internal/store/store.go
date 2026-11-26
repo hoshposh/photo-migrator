@@ -35,6 +35,10 @@ const (
 	// StatusLocked marks a file from Google Photos' private Locked Folder,
 	// held back from upload. Setting it to pending (after review) releases it.
 	StatusLocked Status = "locked"
+	// StatusMotionVideo marks the video half of a motion photo, held back
+	// because the API cannot rebuild motion photos (it would appear as a
+	// separate video). Setting it to pending releases it for upload.
+	StatusMotionVideo Status = "motion_video"
 )
 
 // Store wraps the SQLite database.
@@ -122,11 +126,12 @@ func (s *Store) SetZipStatus(zipPath string, status Status, errMsg string) error
 
 // AllZipItemsComplete returns true when every media_item for the given zip is
 // done: complete, too large for the API (reported by `large-files`), or held
-// back from the Locked Folder (reported by `locked-files`).
+// back from the Locked Folder (`locked-files`), or a held-back motion-photo
+// video half (`motion-videos`).
 func (s *Store) AllZipItemsComplete(zipPath string) (bool, error) {
 	var pending int
 	err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM media_items WHERE source_zip = ? AND status NOT IN ('complete', 'too_large', 'locked')`,
+		`SELECT COUNT(*) FROM media_items WHERE source_zip = ? AND status NOT IN ('complete', 'too_large', 'locked', 'motion_video')`,
 		zipPath,
 	).Scan(&pending)
 	return pending == 0, err
@@ -172,38 +177,40 @@ func (s *Store) RegisterMedia(sourcePath, sourceZip, zipEntry, albumName string)
 	return err
 }
 
-// RegisterLocked registers a Locked Folder file as held back (status locked)
-// if it is new, and reports whether it is still held back. A file whose
-// status was later set to pending (approved after review) is not held back
-// and should be uploaded. Identity rules are the same as RegisterMedia.
-func (s *Store) RegisterLocked(sourcePath, sourceZip, zipEntry string) (held bool, err error) {
+// RegisterHeld registers a file that is held back from upload (status is
+// StatusLocked or StatusMotionVideo) if it is new, and reports whether it is
+// still held back. A file whose status was later set to pending (released,
+// e.g. after review) is not held back and should be uploaded. Identity rules
+// are the same as RegisterMedia.
+func (s *Store) RegisterHeld(status Status, sourcePath, sourceZip, zipEntry string) (held bool, err error) {
 	if sourceZip == "" {
 		_, err = s.db.Exec(
-			`INSERT INTO media_items (source_path, status) VALUES (?, 'locked')
+			`INSERT INTO media_items (source_path, status) VALUES (?, ?)
 			      ON CONFLICT(source_path) DO NOTHING`,
-			sourcePath,
+			sourcePath, string(status),
 		)
 	} else {
 		_, err = s.db.Exec(
 			`INSERT INTO media_items (source_path, source_zip, zip_entry, status)
-			      VALUES (?, ?, ?, 'locked')
+			      VALUES (?, ?, ?, ?)
 			      ON CONFLICT(source_zip, zip_entry) WHERE source_zip IS NOT NULL AND zip_entry IS NOT NULL
 			      DO UPDATE SET source_path = excluded.source_path`,
-			sourcePath, sourceZip, zipEntry,
+			sourcePath, sourceZip, zipEntry, string(status),
 		)
 	}
 	if err != nil {
 		return false, err
 	}
-	var status string
-	if err := s.db.QueryRow(`SELECT status FROM media_items WHERE source_path = ?`, sourcePath).Scan(&status); err != nil {
+	var current string
+	if err := s.db.QueryRow(`SELECT status FROM media_items WHERE source_path = ?`, sourcePath).Scan(&current); err != nil {
 		return false, err
 	}
-	return Status(status) == StatusLocked, nil
+	return Status(current) == StatusLocked || Status(current) == StatusMotionVideo, nil
 }
 
 // IsDone reports whether a media file needs no further upload attempts: it
-// is complete, permanently too large for the API, or held back (locked). Zip-mode files are
+// is complete, permanently too large for the API, or held back (locked,
+// motion_video). Zip-mode files are
 // looked up by (sourceZip, zipEntry), directory-mode files by sourcePath.
 func (s *Store) IsDone(sourceZip, zipEntry, sourcePath string) (bool, error) {
 	var status string
@@ -225,7 +232,7 @@ func (s *Store) IsDone(sourceZip, zipEntry, sourcePath string) (bool, error) {
 		return false, err
 	}
 	switch Status(status) {
-	case StatusComplete, StatusTooLarge, StatusLocked:
+	case StatusComplete, StatusTooLarge, StatusLocked, StatusMotionVideo:
 		return true, nil
 	}
 	return false, nil
@@ -285,14 +292,14 @@ func (s *Store) GetPendingMedia() ([]MediaItem, error) {
 		        COALESCE(upload_token, ''),
 		        status
 		   FROM media_items
-		  WHERE status NOT IN ('complete', 'too_large', 'locked')
+		  WHERE status NOT IN ('complete', 'too_large', 'locked', 'motion_video')
 		  ORDER BY id ASC`,
 	)
 }
 
 // ManualItem is a file the user must handle by hand: one too large for the
-// API (GetLargeFileErrors) or one held back from the Locked Folder
-// (GetLockedFiles). It holds enough context to find the file again.
+// API (GetLargeFileErrors), one held back from the Locked Folder
+// (GetLockedFiles), or a held-back motion-photo video half (GetMotionVideos). It holds enough context to find the file again.
 type ManualItem struct {
 	SourcePath string
 	SourceZip  string // empty in dir mode
@@ -317,6 +324,11 @@ func (s *Store) GetLargeFileErrors() ([]ManualItem, error) {
 // GetLockedFiles returns the Locked Folder files held back from upload.
 func (s *Store) GetLockedFiles() ([]ManualItem, error) {
 	return s.queryManual(` WHERE status = 'locked'`)
+}
+
+// GetMotionVideos returns the motion-photo video halves held back from upload.
+func (s *Store) GetMotionVideos() ([]ManualItem, error) {
+	return s.queryManual(` WHERE status = 'motion_video'`)
 }
 
 func (s *Store) queryManual(where string) ([]ManualItem, error) {
@@ -416,6 +428,7 @@ type Stats struct {
 	ErrorMedia     int
 	TooLargeMedia  int
 	LockedMedia    int
+	MotionMedia    int
 	TotalAlbums    int
 	CompleteAlbums int
 }
@@ -438,9 +451,10 @@ func (s *Store) GetStats() (*Stats, error) {
 		       COALESCE(SUM(CASE WHEN status IN ('pending','bytes_uploaded')    THEN 1 ELSE 0 END), 0),
 		       COALESCE(SUM(CASE WHEN status='error'                            THEN 1 ELSE 0 END), 0),
 		       COALESCE(SUM(CASE WHEN status='too_large'                        THEN 1 ELSE 0 END), 0),
-		       COALESCE(SUM(CASE WHEN status='locked'                           THEN 1 ELSE 0 END), 0)
+		       COALESCE(SUM(CASE WHEN status='locked'                           THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN status='motion_video'                     THEN 1 ELSE 0 END), 0)
 		  FROM media_items`,
-	).Scan(&st.TotalMedia, &st.CompleteMedia, &st.PendingMedia, &st.ErrorMedia, &st.TooLargeMedia, &st.LockedMedia); err != nil {
+	).Scan(&st.TotalMedia, &st.CompleteMedia, &st.PendingMedia, &st.ErrorMedia, &st.TooLargeMedia, &st.LockedMedia, &st.MotionMedia); err != nil {
 		return nil, fmt.Errorf("stats media_items: %w", err)
 	}
 

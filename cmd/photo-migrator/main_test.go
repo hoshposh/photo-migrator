@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -973,5 +975,114 @@ func TestLockedFilesCommand_ListsHeldFiles(t *testing.T) {
 	}
 	if !strings.Contains(out, `"file": "secret.jpg"`) || !strings.Contains(out, `"in_zip_path": "Takeout/Google Photos/Locked Folder/secret.jpg"`) {
 		t.Errorf("locked-files output does not list secret.jpg:\n%s", out)
+	}
+}
+
+// Break caught: standalone videos with unrecognised names never being
+// uploaded (or uploaded without a video name/type), and motion-photo video
+// halves being uploaded as separate videos instead of held back and listed.
+func TestProcessZips_UnrecognisedVideos(t *testing.T) {
+	video := func(marker string) string { return "\x00\x00\x00\x20ftypisom\x00\x00\x02\x00" + marker }
+	var mu sync.Mutex
+	uploads := map[string]int{}        // marker -> count
+	contentType := map[string]string{} // marker -> X-Goog-Upload-Content-Type
+	fileName := map[string]string{}    // upload token -> batchCreate fileName
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/uploads"):
+			body, _ := io.ReadAll(r.Body)
+			marker := "other"
+			for _, m := range []string{"STANDALONE", "MOTION", "STILL"} {
+				if strings.Contains(string(body), m) {
+					marker = m
+				}
+			}
+			mu.Lock()
+			uploads[marker]++
+			contentType[marker] = r.Header.Get("X-Goog-Upload-Content-Type")
+			mu.Unlock()
+			_, _ = io.WriteString(w, "tok-"+marker)
+		case strings.HasSuffix(r.URL.Path, "/mediaItems:batchCreate"):
+			var req struct {
+				NewMediaItems []struct {
+					SimpleMediaItem struct{ UploadToken, FileName string } `json:"simpleMediaItem"`
+				} `json:"newMediaItems"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			tok := req.NewMediaItems[0].SimpleMediaItem.UploadToken
+			mu.Lock()
+			fileName[tok] = req.NewMediaItems[0].SimpleMediaItem.FileName
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{"newMediaItemResults":[{"uploadToken":"`+tok+`","status":{},"mediaItem":{"id":"m-`+tok+`"}}]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer fake.Close()
+	target, _ := url.Parse(fake.URL)
+	client := photos.New(&http.Client{Transport: rewriteTransport{target}})
+
+	zipPath := filepath.Join(t.TempDir(), "takeout-001.zip")
+	writeZipEntries(t, zipPath, map[string]string{
+		"Takeout/Google Photos/Photos from 2020/talk - 3.12.20": video("STANDALONE"),
+		"Takeout/Google Photos/Photos from 2022/PXL_a.MP":       video("MOTION"),
+		"Takeout/Google Photos/Photos from 2022/PXL_a.MP.jpg":   "\xff\xd8\xff\xe0STILL",
+	})
+	dbPath := filepath.Join(t.TempDir(), "m.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	if err := st.RegisterZip(zipPath); err != nil {
+		t.Fatal(err)
+	}
+	logger := zap.NewNop()
+	pool := pipeline.NewPool(pipeline.Config{Workers: 2, RateLimit: 1000, Logger: logger}, client, st)
+	staging := t.TempDir()
+	for run := 0; run < 2; run++ {
+		if err := processZips(context.Background(), []string{zipPath}, staging, st, pool, logger); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if uploads["STANDALONE"] != 1 {
+		t.Errorf("standalone video uploaded %d times, want 1", uploads["STANDALONE"])
+	}
+	if contentType["STANDALONE"] != "video/mp4" {
+		t.Errorf("standalone video content type = %q, want video/mp4", contentType["STANDALONE"])
+	}
+	if fileName["tok-STANDALONE"] != "talk - 3.12.20.mp4" {
+		t.Errorf("standalone video uploaded as %q, want \"talk - 3.12.20.mp4\"", fileName["tok-STANDALONE"])
+	}
+	if uploads["MOTION"] != 0 {
+		t.Errorf("motion-photo video half uploaded %d times, want 0 (held back)", uploads["MOTION"])
+	}
+	if uploads["STILL"] != 1 {
+		t.Errorf("motion photo still uploaded %d times, want 1", uploads["STILL"])
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	var motionStatus, zipStatus string
+	if err := db.QueryRow(`SELECT status FROM media_items WHERE zip_entry LIKE '%PXL_a.MP'`).Scan(&motionStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT status FROM zip_archives`).Scan(&zipStatus); err != nil {
+		t.Fatal(err)
+	}
+	if motionStatus != "motion_video" || zipStatus != "complete" {
+		t.Errorf("motion half status = %q, zip = %q; want \"motion_video\" and \"complete\"", motionStatus, zipStatus)
+	}
+	listed, err := st.GetMotionVideos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || filepath.Base(listed[0].SourcePath) != "PXL_a.MP" {
+		t.Errorf("GetMotionVideos = %+v, want just PXL_a.MP", listed)
 	}
 }

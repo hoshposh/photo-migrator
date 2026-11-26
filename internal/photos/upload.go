@@ -20,7 +20,12 @@ var ErrTooLarge = errors.New("file too large for the Google Photos API")
 
 // UploadBytes streams the raw bytes of mediaPath to the Google Photos upload
 // endpoint and returns an opaque uploadToken.
-func (c *Client) UploadBytes(ctx context.Context, mediaPath string) (_ string, err error) {
+// mime is sent as X-Goog-Upload-Content-Type; empty means derive it from the
+// file name.
+func (c *Client) UploadBytes(ctx context.Context, mediaPath, mime string) (_ string, err error) {
+	if mime == "" {
+		mime = mimeType(mediaPath)
+	}
 	f, err := os.Open(mediaPath)
 	if err != nil {
 		return "", fmt.Errorf("open media file: %w", err)
@@ -42,7 +47,7 @@ func (c *Client) UploadBytes(ctx context.Context, mediaPath string) (_ string, e
 	}
 	req.ContentLength = fi.Size()
 	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("X-Goog-Upload-Content-Type", mimeType(mediaPath))
+	req.Header.Set("X-Goog-Upload-Content-Type", mime)
 	req.Header.Set("X-Goog-Upload-Protocol", "raw")
 
 	// GetBody lets doWithRetry re-open the file on a retry.
@@ -171,9 +176,15 @@ func (c *Client) BatchCreate(ctx context.Context, albumID string, items []newMed
 // upload dance (byte upload → batchCreate) for a single media file.
 //
 // Returns the Google Photos media item ID on success.
-func (c *Client) UploadMedia(ctx context.Context, mediaPath, description, albumID string) (string, error) {
+//
+// fileName and mime override the name and MIME type sent to Google; empty
+// means derive them from mediaPath.
+func (c *Client) UploadMedia(ctx context.Context, mediaPath, fileName, mime, description, albumID string) (string, error) {
+	if fileName == "" {
+		fileName = filepath.Base(mediaPath)
+	}
 	// Step 1: byte upload.
-	token, err := c.UploadBytes(ctx, mediaPath)
+	token, err := c.UploadBytes(ctx, mediaPath, mime)
 	if err != nil {
 		return "", fmt.Errorf("byte upload: %w", err)
 	}
@@ -184,7 +195,7 @@ func (c *Client) UploadMedia(ctx context.Context, mediaPath, description, albumI
 			Description: description,
 			SimpleMediaItem: simpleMediaItem{
 				UploadToken: token,
-				FileName:    filepath.Base(mediaPath),
+				FileName:    fileName,
 			},
 		},
 	})

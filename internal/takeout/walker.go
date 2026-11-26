@@ -17,6 +17,43 @@ import (
 // yearFolderRe matches Google Takeout year-based folders, e.g. "Photos from 2016".
 var yearFolderRe = regexp.MustCompile(`^Photos from \d{4}$`)
 
+// motionPartRe matches the names Takeout gives the video half of a motion
+// photo: PXL_x.MP, PXL_x.MP~2, PXL_x.RAW-01.MP.COVER (the still is the same
+// name plus ".jpg", possibly in another zip).
+var motionPartRe = regexp.MustCompile(`(?i)\.mp(~\d+)?(\.cover)?$`)
+
+// videoBrands maps ISO base-media "ftyp" brands that mean video to a MIME
+// type and extension. Image formats in the same container family (HEIC,
+// AVIF, CR3) use other brands and are deliberately not listed.
+var videoBrands = map[string][2]string{
+	"isom": {"video/mp4", ".mp4"}, "iso2": {"video/mp4", ".mp4"}, "iso4": {"video/mp4", ".mp4"},
+	"iso5": {"video/mp4", ".mp4"}, "iso6": {"video/mp4", ".mp4"}, "mp41": {"video/mp4", ".mp4"},
+	"mp42": {"video/mp4", ".mp4"}, "avc1": {"video/mp4", ".mp4"}, "dash": {"video/mp4", ".mp4"},
+	"M4V ": {"video/x-m4v", ".m4v"}, "M4VP": {"video/x-m4v", ".m4v"},
+	"qt  ": {"video/quicktime", ".mov"},
+	"3gp4": {"video/3gpp", ".3gp"}, "3gp5": {"video/3gpp", ".3gp"}, "3gp6": {"video/3gpp", ".3gp"},
+	"3g2a": {"video/3gpp2", ".3g2"},
+}
+
+// sniffVideo reports whether the file is an MP4/QuickTime-family video by
+// its content, returning its MIME type and usual extension.
+func sniffVideo(path string) (mime, ext string, ok bool) {
+	if strings.HasPrefix(filepath.Base(path), "._") || strings.EqualFold(filepath.Ext(path), ".json") {
+		return "", "", false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "", "", false
+	}
+	defer func() { _ = f.Close() }()
+	var b [12]byte
+	if _, err := io.ReadFull(f, b[:]); err != nil || string(b[4:8]) != "ftyp" {
+		return "", "", false
+	}
+	v, ok := videoBrands[string(b[8:12])]
+	return v[0], v[1], ok
+}
+
 // LockedFolder is Takeout's folder for Google Photos' private, passcode-
 // protected Locked Folder. The API cannot put files there, so callers hold
 // these files back from upload (MigrationJob.Locked) unless approved.
@@ -52,6 +89,16 @@ type MigrationJob struct {
 	Sidecar *Sidecar
 	// Locked reports that the file came from Google Photos' Locked Folder.
 	Locked bool
+	// MotionPart reports that the file is the video half of a motion photo
+	// (e.g. PXL_x.MP or PXL_x.MP.COVER next to PXL_x.MP.jpg). The API cannot
+	// rebuild a motion photo, so callers hold these back.
+	MotionPart bool
+	// UploadName and MimeType override the file name and MIME type sent to
+	// Google for files whose extension does not describe them (a video named
+	// "talk - 3.12.20" is uploaded as "talk - 3.12.20.mp4", video/mp4).
+	// Empty means derive both from the file name.
+	UploadName string
+	MimeType   string
 }
 
 // IsZipMode returns true if dir contains at least one .zip file.
@@ -210,8 +257,24 @@ func WalkDirectory(
 			logger.Warn("walk error", zap.String("path", path), zap.Error(err))
 			return nil // log and continue
 		}
-		if d.IsDir() || !IsMediaFile(path) {
+		if d.IsDir() {
 			return nil
+		}
+		var motion bool
+		var uploadName, mime string
+		if !IsMediaFile(path) {
+			// Takeout exports some videos under names with no usable
+			// extension (motion-photo halves, "clip - 3.12.20"); recognise
+			// them by content.
+			vmime, vext, ok := sniffVideo(path)
+			if !ok {
+				return nil
+			}
+			if base := filepath.Base(path); motionPartRe.MatchString(base) {
+				motion = true
+			} else {
+				uploadName, mime = base+vext, vmime
+			}
 		}
 
 		zipEntry := ""
@@ -242,6 +305,9 @@ func WalkDirectory(
 			ZipEntry:    zipEntry,
 			Sidecar:     sidecar,
 			Locked:      topFolder(path, dir) == LockedFolder,
+			MotionPart:  motion,
+			UploadName:  uploadName,
+			MimeType:    mime,
 		})
 		return nil
 	})
