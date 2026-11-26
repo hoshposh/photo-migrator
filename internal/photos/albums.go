@@ -17,7 +17,12 @@ type Album struct {
 
 // CreateAlbum creates a new album in the destination Google Photos account
 // and returns its metadata.
+//
+// Calls are serialised with other write calls (see Client.writeMu).
 func (c *Client) CreateAlbum(ctx context.Context, title string) (*Album, error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
 	payload, err := json.Marshal(map[string]any{
 		"album": map[string]string{"title": title},
 	})

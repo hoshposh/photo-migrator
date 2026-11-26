@@ -410,7 +410,7 @@ The Google Photos API allows approximately **75 requests per 15 seconds** per us
 ./photo-migrator run ... --rate-limit 2
 ```
 
-The limit counts every API request, including retries; each file needs two (the upload, then a `batchCreate` that adds it to the library). Files upload in parallel, but `batchCreate` calls are made one at a time, as Google requires. On `429` and `5xx` responses the tool backs off exponentially (up to 60 s), and waits longer if Google's `Retry-After` header asks it to (up to 2 minutes). Every retry is logged as a warning, for example `retrying after HTTP 429 call=batchCreate attempt=1 retry_after=1m0s wait=1m0s`, so a pause in a run always has a visible cause.
+The limit counts every API request, including retries. Files upload in parallel; uploaded files are then added to the library in batches of up to 50 per album with `batchCreate` (sent when a batch is full or after about 2 seconds). Google rate-limits these write calls separately, so batching keeps them rare, and they are made one at a time, as Google requires. On `429` and `5xx` responses the tool backs off exponentially (up to 60 s), and waits longer if Google's `Retry-After` header asks it to (up to 2 minutes). Every retry is logged as a warning, for example `retrying after HTTP 429 call=batchCreate attempt=1 retry_after=1m0s wait=1m0s`, so a pause in a run always has a visible cause.
 
 ---
 

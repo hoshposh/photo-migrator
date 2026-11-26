@@ -4,8 +4,10 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"go.uber.org/zap"
 	"golang.org/x/sync/singleflight"
@@ -31,6 +33,11 @@ type Config struct {
 	// Takeout sidecar JSON into file metadata before uploading.
 	RestoreMetadata bool
 	Logger          *zap.Logger
+	// BatchSize is the most files added per batchCreate call (default and
+	// maximum 50); BatchDelay is how long a file may wait for its batch to
+	// fill (default 2s). See batcher.
+	BatchSize  int
+	BatchDelay time.Duration
 }
 
 // Pool is a concurrent worker pool that uploads MigrationJobs to Google Photos.
@@ -60,6 +67,10 @@ func (p *Pool) DryRun() bool { return p.cfg.DryRun }
 //
 // If Google rejects the sign-in (photos.ErrAuthFailed), every worker stops,
 // the affected items stay pending, and Run returns that error.
+//
+// Workers upload bytes in parallel and hand each file to a batcher, which
+// adds files to the library in batches (see batcher). Run returns only once
+// every uploaded file has been sent, including after an interrupt.
 func (p *Pool) Run(ctx context.Context, jobs <-chan Job) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -72,6 +83,12 @@ func (p *Pool) Run(ctx context.Context, jobs <-chan Job) error {
 			fatal = err
 			cancel()
 		})
+	}
+
+	var b *batcher
+	if !p.cfg.DryRun {
+		b = p.newBatcher(stop)
+		go b.loop()
 	}
 
 	var wg sync.WaitGroup
@@ -87,16 +104,19 @@ func (p *Pool) Run(ctx context.Context, jobs <-chan Job) error {
 					if !ok {
 						return
 					}
-					p.process(ctx, job, stop)
+					p.process(ctx, job, stop, b)
 				}
 			}
 		}()
 	}
 	wg.Wait()
+	if b != nil {
+		b.close() // send every file already uploaded
+	}
 	return fatal
 }
 
-func (p *Pool) process(ctx context.Context, job Job, stop func(error)) {
+func (p *Pool) process(ctx context.Context, job Job, stop func(error), b *batcher) {
 	fields := []zap.Field{
 		zap.String("file", filepath.Base(job.MediaPath)),
 		zap.String("album", job.AlbumName),
@@ -151,11 +171,12 @@ func (p *Pool) process(ctx context.Context, job Job, stop func(error)) {
 		}
 	}
 
-	// Two-step upload: byte stream → batchCreate. From here the upload is in
-	// flight, so an interrupt (Ctrl+C) lets it finish rather than aborting it
-	// and recording a spurious failure. A second Ctrl+C exits the process.
-	mediaID, err := p.client.UploadMedia(photos.WithLogger(context.WithoutCancel(ctx), log), job.MediaPath, job.UploadName, job.MimeType, description, albumID)
+	// Step 1 of 2: upload the bytes. From here the upload is in flight, so an
+	// interrupt (Ctrl+C) lets it finish rather than aborting it and recording
+	// a spurious failure. A second Ctrl+C exits the process.
+	token, err := p.client.UploadBytes(photos.WithLogger(context.WithoutCancel(ctx), log), job.MediaPath, job.MimeType)
 	if err != nil {
+		err = fmt.Errorf("byte upload: %w", err)
 		if errors.Is(err, photos.ErrAuthFailed) {
 			stop(err) // not this file's fault: leave pending, stop the run
 			return
@@ -170,11 +191,19 @@ func (p *Pool) process(ctx context.Context, job Job, stop func(error)) {
 		return
 	}
 
-	if err := p.store.SetMediaComplete(job.MediaPath, mediaID); err != nil {
-		log.Error("mark complete", zap.Error(err))
-		return
+	// Step 2 of 2: the batcher adds the file to the library, together with
+	// others for the same album, and records the result.
+	fileName := job.UploadName
+	if fileName == "" {
+		fileName = filepath.Base(job.MediaPath)
 	}
-	log.Info("✓ uploaded", zap.String("mediaID", mediaID))
+	b.add(uploaded{
+		job:     job,
+		log:     log,
+		item:    photos.NewItem{UploadToken: token, FileName: fileName, Description: description},
+		albumID: albumID,
+		added:   time.Now(),
+	})
 }
 
 // resolveAlbum returns the Google Photos album ID for albumName, creating the

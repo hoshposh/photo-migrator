@@ -34,10 +34,11 @@ type Client struct {
 	// limiter, if set, gates every HTTP request (including retries), so the
 	// configured rate is requests per second, not files per second.
 	limiter *rate.Limiter
-	// batchMu serialises batchCreate calls: Google's upload guide says
-	// batchCreate for one user must be called one at a time, and concurrent
-	// calls are answered with HTTP 429. Byte uploads stay parallel.
-	batchMu sync.Mutex
+	// writeMu serialises write calls (batchCreate, albums.create): Google's
+	// upload guide says batchCreate for one user must be called one at a
+	// time, and write calls share a per-user limit (HTTP 429 when exceeded).
+	// Byte uploads stay parallel.
+	writeMu sync.Mutex
 }
 
 // New returns a Client that uses the provided *http.Client (which must already

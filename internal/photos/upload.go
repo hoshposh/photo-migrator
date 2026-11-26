@@ -95,6 +95,16 @@ type simpleMediaItem struct {
 	FileName    string `json:"fileName"`
 }
 
+// MaxBatchItems is the most items one batchCreate call accepts.
+const MaxBatchItems = 50
+
+// NewItem is one uploaded file to add to the library with BatchCreate.
+type NewItem struct {
+	UploadToken string // from UploadBytes
+	FileName    string // name shown in Google Photos
+	Description string // optional
+}
+
 // BatchCreateResult is the per-item result from a batchCreate call.
 type BatchCreateResult struct {
 	UploadToken string
@@ -119,14 +129,21 @@ type batchCreateResp struct {
 // BatchCreate submits up to 50 media items for creation in a single API call.
 // albumID may be empty to upload to the library root.
 //
-// Calls are serialised across goroutines (see Client.batchMu).
-func (c *Client) BatchCreate(ctx context.Context, albumID string, items []newMediaItem) ([]BatchCreateResult, error) {
-	c.batchMu.Lock()
-	defer c.batchMu.Unlock()
+// Calls are serialised with other write calls (see Client.writeMu).
+func (c *Client) BatchCreate(ctx context.Context, albumID string, items []NewItem) ([]BatchCreateResult, error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 
+	reqItems := make([]newMediaItem, len(items))
+	for i, it := range items {
+		reqItems[i] = newMediaItem{
+			Description:     it.Description,
+			SimpleMediaItem: simpleMediaItem{UploadToken: it.UploadToken, FileName: it.FileName},
+		}
+	}
 	payload, err := json.Marshal(batchCreateReq{
 		AlbumID:       albumID,
-		NewMediaItems: items,
+		NewMediaItems: reqItems,
 	})
 	if err != nil {
 		return nil, err
@@ -195,14 +212,8 @@ func (c *Client) UploadMedia(ctx context.Context, mediaPath, fileName, mime, des
 	}
 
 	// Step 2: batchCreate (single item).
-	results, err := c.BatchCreate(ctx, albumID, []newMediaItem{
-		{
-			Description: description,
-			SimpleMediaItem: simpleMediaItem{
-				UploadToken: token,
-				FileName:    fileName,
-			},
-		},
+	results, err := c.BatchCreate(ctx, albumID, []NewItem{
+		{UploadToken: token, FileName: fileName, Description: description},
 	})
 	if err != nil {
 		return "", fmt.Errorf("batchCreate: %w", err)

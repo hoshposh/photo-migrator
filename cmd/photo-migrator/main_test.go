@@ -410,9 +410,9 @@ func TestProcessZips_InterruptFinishesInFlightUpload(t *testing.T) {
 			uploads.Add(1)
 			started <- struct{}{}
 			<-release
-			_, _ = io.WriteString(w, "upload-token")
+			_, _ = io.WriteString(w, nextToken())
 		case strings.HasSuffix(r.URL.Path, "/mediaItems:batchCreate"):
-			_, _ = io.WriteString(w, `{"newMediaItemResults":[{"uploadToken":"upload-token","status":{},"mediaItem":{"id":"media-1"}}]}`)
+			echoBatchCreate(w, r, nil)
 		default:
 			http.NotFound(w, r)
 		}
@@ -641,9 +641,9 @@ func TestProcessZips_TooLargeFileIsNotRetried(t *testing.T) {
 				_, _ = io.WriteString(w, `{"code": 3, "message": "Uploaded photo must not have more than 209715200 bytes."}`)
 				return
 			}
-			_, _ = io.WriteString(w, "upload-token")
+			_, _ = io.WriteString(w, nextToken())
 		case strings.HasSuffix(r.URL.Path, "/mediaItems:batchCreate"):
-			_, _ = io.WriteString(w, `{"newMediaItemResults":[{"uploadToken":"upload-token","status":{},"mediaItem":{"id":"media-1"}}]}`)
+			echoBatchCreate(w, r, nil)
 		default:
 			http.NotFound(w, r)
 		}
@@ -717,9 +717,9 @@ func TestProcessZips_StagingDirChangeDoesNotReupload(t *testing.T) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/uploads"):
 			uploads.Add(1)
-			_, _ = io.WriteString(w, "upload-token")
+			_, _ = io.WriteString(w, nextToken())
 		case strings.HasSuffix(r.URL.Path, "/mediaItems:batchCreate"):
-			_, _ = io.WriteString(w, `{"newMediaItemResults":[{"uploadToken":"upload-token","status":{},"mediaItem":{"id":"media-1"}}]}`)
+			echoBatchCreate(w, r, nil)
 		default:
 			http.NotFound(w, r)
 		}
@@ -830,9 +830,9 @@ func newLockedFixture(t *testing.T) *lockedFixture {
 			if string(body) == "SECRET" {
 				fx.secretUploads.Add(1)
 			}
-			_, _ = io.WriteString(w, "upload-token")
+			_, _ = io.WriteString(w, nextToken())
 		case strings.HasSuffix(r.URL.Path, "/mediaItems:batchCreate"):
-			_, _ = io.WriteString(w, `{"newMediaItemResults":[{"uploadToken":"upload-token","status":{},"mediaItem":{"id":"media-1"}}]}`)
+			echoBatchCreate(w, r, nil)
 		case strings.HasSuffix(r.URL.Path, "/albums"):
 			fx.albumsCreated.Add(1)
 			_, _ = io.WriteString(w, `{"id":"album-1","title":"x"}`)
@@ -1004,17 +1004,12 @@ func TestProcessZips_UnrecognisedVideos(t *testing.T) {
 			mu.Unlock()
 			_, _ = io.WriteString(w, "tok-"+marker)
 		case strings.HasSuffix(r.URL.Path, "/mediaItems:batchCreate"):
-			var req struct {
-				NewMediaItems []struct {
-					SimpleMediaItem struct{ UploadToken, FileName string } `json:"simpleMediaItem"`
-				} `json:"newMediaItems"`
-			}
-			_ = json.NewDecoder(r.Body).Decode(&req)
-			tok := req.NewMediaItems[0].SimpleMediaItem.UploadToken
+			req := echoBatchCreate(w, r, nil)
 			mu.Lock()
-			fileName[tok] = req.NewMediaItems[0].SimpleMediaItem.FileName
+			for _, it := range req.NewMediaItems {
+				fileName[it.SimpleMediaItem.UploadToken] = it.SimpleMediaItem.FileName
+			}
 			mu.Unlock()
-			_, _ = io.WriteString(w, `{"newMediaItemResults":[{"uploadToken":"`+tok+`","status":{},"mediaItem":{"id":"m-`+tok+`"}}]}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -1229,13 +1224,13 @@ func TestProcessZips_EveryLineNamesItsZip(t *testing.T) {
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/uploads"):
-			_, _ = io.WriteString(w, "tok")
+			_, _ = io.WriteString(w, nextToken())
 		case strings.HasSuffix(r.URL.Path, "/mediaItems:batchCreate"):
 			if batchCalls.Add(1) == 1 { // one 429, so a retry line is logged too
 				w.WriteHeader(http.StatusTooManyRequests)
 				return
 			}
-			_, _ = io.WriteString(w, `{"newMediaItemResults":[{"uploadToken":"tok","status":{},"mediaItem":{"id":"m"}}]}`)
+			echoBatchCreate(w, r, nil)
 		case strings.HasSuffix(r.URL.Path, "/albums"):
 			_, _ = io.WriteString(w, `{"id":"album-1","title":"Trip"}`)
 		default:
@@ -1283,6 +1278,192 @@ func TestProcessZips_EveryLineNamesItsZip(t *testing.T) {
 		}
 		if n != 1 || e.ContextMap()["zip"] != "takeout-001.zip" {
 			t.Errorf("%q: zip fields = %d, zip = %v; want exactly one zip=\"takeout-001.zip\"", e.Message, n, e.ContextMap()["zip"])
+		}
+	}
+}
+
+var testTokenSeq atomic.Int64
+
+// nextToken returns a unique upload token, as Google's upload endpoint does.
+func nextToken() string { return fmt.Sprintf("tok-%d", testTokenSeq.Add(1)) }
+
+// batchRequest mirrors the body of a batchCreate request.
+type batchRequest struct {
+	AlbumID       string `json:"albumId"`
+	NewMediaItems []struct {
+		SimpleMediaItem struct{ UploadToken, FileName string } `json:"simpleMediaItem"`
+	} `json:"newMediaItems"`
+}
+
+// echoBatchCreate answers a batchCreate like Google: one result per item,
+// with media ID "m-<token>". Items whose file name is in fail get that
+// status message (code 3) instead. It returns the decoded request.
+func echoBatchCreate(w http.ResponseWriter, r *http.Request, fail map[string]string) batchRequest {
+	var req batchRequest
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	type status struct {
+		Code    int    `json:"code,omitempty"`
+		Message string `json:"message,omitempty"`
+	}
+	type result struct {
+		UploadToken string `json:"uploadToken"`
+		Status      status `json:"status"`
+		MediaItem   *struct {
+			ID string `json:"id"`
+		} `json:"mediaItem,omitempty"`
+	}
+	var out struct {
+		NewMediaItemResults []result `json:"newMediaItemResults"`
+	}
+	for _, it := range req.NewMediaItems {
+		tok := it.SimpleMediaItem.UploadToken
+		if msg, ok := fail[it.SimpleMediaItem.FileName]; ok {
+			out.NewMediaItemResults = append(out.NewMediaItemResults, result{UploadToken: tok, Status: status{Code: 3, Message: msg}})
+			continue
+		}
+		res := result{UploadToken: tok}
+		res.MediaItem = &struct {
+			ID string `json:"id"`
+		}{ID: "m-" + tok}
+		out.NewMediaItemResults = append(out.NewMediaItemResults, res)
+	}
+	_ = json.NewEncoder(w).Encode(out)
+	return req
+}
+
+// batchFixture runs processZips over a zip against a fake Photos API that
+// records every batchCreate call.
+type batchFixture struct {
+	mu     sync.Mutex
+	calls  []batchRequest
+	fail   map[string]string
+	dbPath string
+}
+
+func (fx *batchFixture) run(t *testing.T, entries map[string]string) *store.Store {
+	t.Helper()
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/uploads"):
+			_, _ = io.WriteString(w, nextToken())
+		case strings.HasSuffix(r.URL.Path, "/mediaItems:batchCreate"):
+			req := echoBatchCreate(w, r, fx.fail)
+			fx.mu.Lock()
+			fx.calls = append(fx.calls, req)
+			fx.mu.Unlock()
+		case strings.HasSuffix(r.URL.Path, "/albums"):
+			_, _ = io.WriteString(w, `{"id":"album-trip","title":"Trip"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(fake.Close)
+	target, _ := url.Parse(fake.URL)
+	client := photos.New(&http.Client{Transport: rewriteTransport{target}})
+
+	zipPath := filepath.Join(t.TempDir(), "takeout-001.zip")
+	writeZipEntries(t, zipPath, entries)
+	fx.dbPath = filepath.Join(t.TempDir(), "m.db")
+	st, err := store.Open(fx.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if err := st.RegisterZip(zipPath); err != nil {
+		t.Fatal(err)
+	}
+	logger := zap.NewNop()
+	pool := pipeline.NewPool(pipeline.Config{Workers: 4, Logger: logger}, client, st)
+	if err := processZips(context.Background(), []string{zipPath}, t.TempDir(), st, pool, logger); err != nil {
+		t.Fatal(err)
+	}
+	return st
+}
+
+// statuses returns file name -> (status, media ID, error message).
+func (fx *batchFixture) statuses(t *testing.T) map[string][3]string {
+	t.Helper()
+	db, err := sql.Open("sqlite", fx.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	rows, err := db.Query(`SELECT zip_entry, status, COALESCE(photos_media_id,''), COALESCE(error_message,'') FROM media_items`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[string][3]string{}
+	for rows.Next() {
+		var e, st, id, msg string
+		if err := rows.Scan(&e, &st, &id, &msg); err != nil {
+			t.Fatal(err)
+		}
+		out[filepath.Base(e)] = [3]string{st, id, msg}
+	}
+	return out
+}
+
+// Break caught: one batchCreate call per photo. Google rate-limits these
+// write calls (HTTP 429 every few seconds in a real run), while one call can
+// create up to 50 items.
+func TestProcessZips_BatchesCreateCalls(t *testing.T) {
+	entries := map[string]string{}
+	for i := 0; i < 12; i++ {
+		entries[fmt.Sprintf("Takeout/Google Photos/Photos from 2020/root-%02d.jpg", i)] = fmt.Sprintf("\xff\xd8\xff\xe0root%d", i)
+	}
+	for i := 0; i < 3; i++ {
+		entries[fmt.Sprintf("Takeout/Google Photos/Trip/trip-%d.jpg", i)] = fmt.Sprintf("\xff\xd8\xff\xe0trip%d", i)
+	}
+	fx := &batchFixture{}
+	fx.run(t, entries)
+
+	fx.mu.Lock()
+	calls := fx.calls
+	fx.mu.Unlock()
+	if len(calls) > 4 {
+		t.Errorf("%d batchCreate calls for 15 files, want at most 4 (items should be batched)", len(calls))
+	}
+	created := 0
+	for _, c := range calls {
+		created += len(c.NewMediaItems)
+		for _, it := range c.NewMediaItems {
+			inTrip := strings.HasPrefix(it.SimpleMediaItem.FileName, "trip-")
+			if inTrip != (c.AlbumID == "album-trip") {
+				t.Errorf("%s sent in a batch for album %q", it.SimpleMediaItem.FileName, c.AlbumID)
+			}
+		}
+	}
+	if created != 15 {
+		t.Errorf("batchCreate created %d items, want 15", created)
+	}
+	ids := map[string]bool{}
+	for name, s := range fx.statuses(t) {
+		if s[0] != "complete" || !strings.HasPrefix(s[1], "m-tok-") {
+			t.Errorf("%s: status %q media ID %q, want complete with its own ID", name, s[0], s[1])
+		}
+		if ids[s[1]] {
+			t.Errorf("%s: media ID %s shared with another file", name, s[1])
+		}
+		ids[s[1]] = true
+	}
+}
+
+// Guard: a batch where Google rejects one item must fail only that file.
+func TestProcessZips_BatchItemFailureFailsOnlyThatFile(t *testing.T) {
+	fx := &batchFixture{fail: map[string]string{"bad.jpg": "Failed: invalid media"}}
+	fx.run(t, map[string]string{
+		"Takeout/Google Photos/Photos from 2020/good-1.jpg": "\xff\xd8\xff\xe0one",
+		"Takeout/Google Photos/Photos from 2020/bad.jpg":    "\xff\xd8\xff\xe0two",
+		"Takeout/Google Photos/Photos from 2020/good-2.jpg": "\xff\xd8\xff\xe0three",
+	})
+	got := fx.statuses(t)
+	if got["bad.jpg"][0] != "error" || !strings.Contains(got["bad.jpg"][2], "Failed: invalid media") {
+		t.Errorf("bad.jpg = %v, want error mentioning Google's message", got["bad.jpg"])
+	}
+	for _, n := range []string{"good-1.jpg", "good-2.jpg"} {
+		if got[n][0] != "complete" {
+			t.Errorf("%s = %v, want complete", n, got[n])
 		}
 	}
 }

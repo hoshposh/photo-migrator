@@ -53,6 +53,11 @@ func (f *fakeAPI) client(t *testing.T, opts ...Option) *Client {
 			time.Sleep(f.delay)
 			f.uploadActive.Add(-1)
 			_, _ = io.WriteString(w, "tok")
+		case strings.HasSuffix(r.URL.Path, "/albums"):
+			maxInto(&f.batchMaxPar, f.batchActive.Add(1)) // albums.create is a write too
+			time.Sleep(f.delay)
+			f.batchActive.Add(-1)
+			_, _ = io.WriteString(w, `{"id":"album-1","title":"x"}`)
 		case strings.HasSuffix(r.URL.Path, "/mediaItems:batchCreate"):
 			maxInto(&f.batchMaxPar, f.batchActive.Add(1))
 			time.Sleep(f.delay)
@@ -180,5 +185,32 @@ func TestRetryIsLogged(t *testing.T) {
 		if m[k] != v {
 			t.Errorf("field %s = %v (%T), want %v", k, m[k], m[k], v)
 		}
+	}
+}
+
+// Break caught: album creation running alongside batchCreate; both are
+// write calls that share Google's per-user write limit.
+func TestWritesNeverOverlap(t *testing.T) {
+	f := &fakeAPI{delay: 50 * time.Millisecond}
+	c := f.client(t)
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if _, err := c.CreateAlbum(context.Background(), "Trip"); err != nil {
+				t.Error(err)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			if _, err := c.UploadMedia(context.Background(), mediaFile(t), "", "", "", ""); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	if n := f.batchMaxPar.Load(); n != 1 {
+		t.Errorf("up to %d write calls (createAlbum/batchCreate) ran at once, want 1", n)
 	}
 }
