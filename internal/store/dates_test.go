@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -341,5 +342,77 @@ func TestSetGoogleURL_OnlyTheLink(t *testing.T) {
 	}
 	if r := dateRowByPath(t, st, "c"); r.GoogleURL != "" {
 		t.Errorf("c was touched: %+v", r)
+	}
+}
+
+// Break caught: improved sidecar matching never reaching photos whose
+// expected date was already saved (or saved as "none"), or the re-lookup
+// migration touching upload progress or Google's answers.
+func TestMigration00009_ClearsTakenDates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "m.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	goose.SetBaseFS(embedMigrations)
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		t.Fatal(err)
+	}
+	goose.SetLogger(goose.NopLogger())
+	if err := goose.UpTo(db, "migrations", 8); err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		`INSERT INTO media_items (source_path, status, photos_media_id, taken_time, taken_time_source, google_time, google_checked_at, google_missing, google_url)
+		 VALUES ('/s/a.jpg', 'complete', 'm-1', 1560535320, 'sidecar', 1764000000, 1764000100, 0, 'https://photos.google.com/lr/photo/a')`,
+		`INSERT INTO media_items (source_path, status, photos_media_id, taken_time_source, google_time, google_checked_at, google_missing)
+		 VALUES ('/s/b-edited.jpg', 'complete', 'm-2', 'none', 1764000000, 1764000100, 0)`,
+		`INSERT INTO media_items (source_path, status, photos_media_id, google_checked_at, google_missing)
+		 VALUES ('/s/c.jpg', 'complete', 'm-3', 1764000100, 1)`,
+		`INSERT INTO media_items (source_path, status, taken_time, taken_time_source) VALUES ('/s/d.jpg', 'pending', 1560535320, 'sidecar')`,
+		`INSERT INTO media_items (source_path, status) VALUES ('/s/e.MP', 'motion_video')`,
+	} {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const others = `SELECT source_path || '|' || status || '|' || COALESCE(photos_media_id, '') || '|' ||
+	       COALESCE(google_time, '') || '|' || COALESCE(google_checked_at, '') || '|' ||
+	       google_missing || '|' || COALESCE(google_url, '') FROM media_items ORDER BY source_path`
+	snapshot := func(q func(string, ...any) (*sql.Rows, error)) []string {
+		t.Helper()
+		rows, err := q(others)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = rows.Close() }()
+		var out []string
+		for rows.Next() {
+			var s string
+			if err := rows.Scan(&s); err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, s)
+		}
+		return out
+	}
+	before := snapshot(db.Query)
+	_ = db.Close()
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open (applies later migrations): %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	var left int
+	if err := st.db.QueryRow(`SELECT COUNT(*) FROM media_items WHERE taken_time IS NOT NULL OR taken_time_source IS NOT NULL`).Scan(&left); err != nil {
+		t.Fatal(err)
+	}
+	if left != 0 {
+		t.Errorf("%d rows still have a saved expected date; want 0", left)
+	}
+	if after := snapshot(st.db.Query); strings.Join(after, "\n") != strings.Join(before, "\n") {
+		t.Errorf("other columns changed:\nbefore %v\nafter  %v", before, after)
 	}
 }

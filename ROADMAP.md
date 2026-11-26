@@ -138,7 +138,7 @@ Every command that changes the database should:
 
 ### 7. Uploaded files show the upload date instead of the date taken
 
-**Status:** the `wrong-dates` report is built, including `--recheck`, which asks Google again about the photos listed as wrong after they are fixed by hand. Finding and fixing the causes is not done. The first known cause: `FindSidecar` misses some Takeout sidecar names (`-edited` copies, `(1)` duplicates, motion-photo MP4/MP files), so those photos have no date to write.
+**Status:** the `wrong-dates` report is built, including `--recheck`, which asks Google again about the photos listed as wrong after they are fixed by hand. The first known cause is fixed: the sidecar lookup now finds the sidecars Takeout names differently (edited copies, Live Photo / motion videos, numbered `(1)` duplicates, names cut short), and stops giving a file its numbered duplicate's sidecar; on one real Takeout this left about 20 of 2,168 such photos without a sidecar. Other causes (exiftool failures, formats whose date Google doesn't read) are not investigated yet.
 
 **Problem:** some photos arrive in the destination account dated the day this tool uploaded them, not the day they were taken, so they appear in the wrong place in the timeline. `restore-metadata` already writes the sidecar's date into each file with exiftool before upload, so these are files where that did not work. Likely causes, not yet confirmed:
 
