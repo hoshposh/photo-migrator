@@ -77,6 +77,8 @@ func callName(req *http.Request) string {
 		return "upload"
 	case strings.HasSuffix(p, ":batchCreate"):
 		return "batchCreate"
+	case strings.HasSuffix(p, ":batchGet"):
+		return "batchGet"
 	case p == "albums":
 		return "createAlbum"
 	default:

@@ -129,12 +129,13 @@ The tool uploads to Account B via the Google Photos Library API. You need an OAu
 1. Go to **APIs & Services → OAuth consent screen**.
 2. Select **External** as the User Type and click **Create**.
 3. Fill in the required fields (App name, support email). You can use any values.
-4. On the **Scopes** page, click **Add or Remove Scopes** and add both:
+4. On the **Scopes** page, click **Add or Remove Scopes** and add all three:
    ```
    https://www.googleapis.com/auth/photoslibrary.appendonly
    https://www.googleapis.com/auth/photoslibrary.edit.appcreateddata
+   https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata
    ```
-   The first allows uploading new media; the second allows creating albums and adding the app's uploads to them. (The older catch-all `photoslibrary` scope is deprecated.)
+   The first allows uploading new media; the second allows creating albums and adding the app's uploads to them; the third allows reading back the dates of the items the app uploaded. (The older catch-all `photoslibrary` scope is deprecated.) If you set up the consent screen before the third scope existed, add it there and run `photo-migrator auth` again so the saved sign-in includes it.
 5. On the **Test users** page, click **Add Users** and enter **Account B's email address**.
 6. Click **Save and Continue**, then **Back to Dashboard**.
 

@@ -25,9 +25,11 @@ import (
 // granular scopes:
 //   - appendonly: upload new media items
 //   - edit.appcreateddata: create albums and add app-uploaded items to them
+//   - readonly.appcreateddata: read back the dates of items this app uploaded
 var Scopes = []string{
 	"https://www.googleapis.com/auth/photoslibrary.appendonly",
 	"https://www.googleapis.com/auth/photoslibrary.edit.appcreateddata",
+	"https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata",
 }
 
 // LoadConfig reads an OAuth2 credentials.json file downloaded from the

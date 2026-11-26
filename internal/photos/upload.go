@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 )
 
 type progressKey struct{}
@@ -150,6 +151,8 @@ type BatchCreateResult struct {
 	MediaItemID string
 	StatusCode  int
 	StatusMsg   string
+	// CreationTime is mediaItem.mediaMetadata.creationTime; zero if absent.
+	CreationTime time.Time
 }
 
 type batchCreateResp struct {
@@ -160,7 +163,8 @@ type batchCreateResp struct {
 			Code    int    `json:"code"`
 		} `json:"status"`
 		MediaItem struct {
-			ID string `json:"id"`
+			ID            string        `json:"id"`
+			MediaMetadata mediaMetadata `json:"mediaMetadata"`
 		} `json:"mediaItem"`
 	} `json:"newMediaItemResults"`
 }
@@ -224,6 +228,8 @@ func (c *Client) BatchCreate(ctx context.Context, albumID string, items []NewIte
 			MediaItemID: r.MediaItem.ID,
 			StatusCode:  r.Status.Code,
 			StatusMsg:   r.Status.Message,
+
+			CreationTime: parseCreationTime(r.MediaItem.MediaMetadata.CreationTime),
 		}
 		if r.Status.Code != 0 {
 			res.StatusMsg = r.Status.Message + " (code " + strconv.Itoa(r.Status.Code) + ")"

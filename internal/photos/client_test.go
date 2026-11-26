@@ -243,3 +243,29 @@ func TestUploadBytesReportsProgress(t *testing.T) {
 		t.Errorf("progress = %d bytes, want 300000 (reset on retry, not doubled)", got)
 	}
 }
+
+func TestBatchCreate_ReturnsCreationTime(t *testing.T) {
+	f := &fakeAPI{onBatch: func(w http.ResponseWriter) bool {
+		_, _ = io.WriteString(w, `{"newMediaItemResults":[`+
+			`{"uploadToken":"t1","status":{},"mediaItem":{"id":"m1","mediaMetadata":{"creationTime":"2021-03-04T05:06:07Z"}}},`+
+			`{"uploadToken":"t2","status":{},"mediaItem":{"id":"m2"}}]}`)
+		return true
+	}}
+	c := f.client(t)
+
+	res, err := c.BatchCreate(context.Background(), "", []NewItem{
+		{UploadToken: "t1", FileName: "a.jpg"}, {UploadToken: "t2", FileName: "b.jpg"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 2 {
+		t.Fatalf("got %d results, want 2", len(res))
+	}
+	if want := time.Date(2021, 3, 4, 5, 6, 7, 0, time.UTC); !res[0].CreationTime.Equal(want) {
+		t.Errorf("CreationTime = %v, want %v", res[0].CreationTime, want)
+	}
+	if !res[1].CreationTime.IsZero() {
+		t.Errorf("CreationTime without metadata = %v, want zero", res[1].CreationTime)
+	}
+}
