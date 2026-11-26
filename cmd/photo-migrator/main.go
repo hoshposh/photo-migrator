@@ -108,6 +108,7 @@ Quick start:
 		newLockedFilesCmd(),
 		newMotionVideosCmd(),
 		newRawPairsCmd(),
+		newWrongDatesCmd(),
 		newConfigCmd(),
 	)
 	return root

@@ -306,6 +306,50 @@ You can then open [photos.google.com](https://photos.google.com/), click
 
 ---
 
+## Checking for photos with a wrong date
+
+Some photos arrive in the destination account dated the day they were uploaded
+instead of the day they were taken. The Google Photos API cannot change a
+photo's date after upload, so these can only be fixed by hand, but the
+`wrong-dates` command tells you which ones:
+
+```bash
+./photo-migrator wrong-dates --takeout-dir /path/to/takeout-zips/
+
+# Machine-readable JSON
+./photo-migrator wrong-dates --takeout-dir /path/to/takeout-zips/ --format json
+```
+
+For every uploaded file it reads the date taken from the file's Takeout
+sidecar JSON (in any of the zips, since Takeout can put a sidecar in a
+different zip than its photo) and asks Google Photos for the date it assigned.
+A photo is listed when the two differ by more than 24 hours, or when copies of
+the same photo disagree about the date. Every answer is saved in the database,
+so later runs only look at new uploads and need neither the zips nor Google.
+
+```
+  ⚠️  Wrong Dates Report — 1 photo(s) uploaded with a date that differs from the date taken
+
+  FILE   ALBUM  SHOULD BE            GOOGLE HAS           ZIP / PATH
+  a.jpg  Trip   2019-06-14 18:02 UTC  2026-07-03 09:41 UTC  takeout-001.zip / Takeout/Google Photos/Trip/a.jpg
+
+  Fix each in Google Photos: open the photo → ⋮ → Edit date & time.
+  Dates are shown in UTC.
+  Not judged: 41 without a sidecar date, 3 deleted or not created by this app.
+```
+
+To fix a photo, find it in Google Photos, open it, and choose
+**⋮ → Edit date & time**.
+
+> [!NOTE]
+> Reading dates from Google needs the `photoslibrary.readonly.appcreateddata`
+> scope. If the command says the saved sign-in lacks it, add the scope on the
+> OAuth consent screen (step 2.3) and run `photo-migrator auth` again.
+> The command is read-only: it never changes upload progress, so it is safe to
+> run at any time, and Ctrl+C keeps the dates already read.
+
+---
+
 ## Checking for files that won't be migrated
 
 A migration uploads every recognised photo and video, holds some back (Locked Folder files, motion-photo video parts) and skips everything else. To see what is skipped, before or during a migration:
@@ -399,6 +443,7 @@ photo-migrator status
 photo-migrator large-files                     # report files too large for the API
 photo-migrator large-files --format json       # machine-readable JSON report
 photo-migrator large-files --extract <dir>     # re-extract oversized files for manual upload
+photo-migrator wrong-dates --takeout-dir <dir> # list uploaded photos whose Google date is not the date taken
 photo-migrator locked-files                    # list Locked Folder files held back from upload
 photo-migrator locked-files --extract <dir>    # extract them to handle by hand
 photo-migrator motion-videos                   # list motion-photo video parts held back from upload

@@ -135,3 +135,33 @@ Every command that changes the database should:
 
 - Files already uploaded are not removed (the API cannot delete). The setting only affects files not yet uploaded, so it is worth deciding before a migration starts.
 - Holding back the DNG means the destination keeps only the processed JPEG of those shots, unless the held-back files are uploaded later by hand.
+
+### 7. Uploaded files show the upload date instead of the date taken
+
+**Status:** the `wrong-dates` report is built; finding and fixing the causes is not.
+
+**Problem:** some photos arrive in the destination account dated the day this tool uploaded them, not the day they were taken, so they appear in the wrong place in the timeline. `restore-metadata` already writes the sidecar's date into each file with exiftool before upload, so these are files where that did not work. Likely causes, not yet confirmed:
+
+- exiftool failed on the file. The worker logs a warning and uploads anyway, and the ledger does not record it.
+- No sidecar was found, or it had no date, so nothing was written.
+- The format has no date field that Google Photos reads, or exiftool cannot write to it (for example some PNG, GIF or video files).
+- The file was uploaded while `restore-metadata` was turned off.
+
+The Library API cannot change a media item's date after upload: `batchCreate` takes no date, and `mediaItems.patch` can change only the description. The date has to be correct in the file when it is uploaded.
+
+**Approach:**
+
+- First find out which files are affected and why, from the run logs and a sample of wrongly dated items, before changing the code.
+- Record the result of `restore-metadata` per file in the ledger (a new column, via a migration): `written`, `no_sidecar`, `no_date`, or `failed` with exiftool's error.
+- Check the date Google actually assigned. The `batchCreate` response includes the new item's `mediaMetadata.creationTime` (confirm this); compare it with the sidecar's `photoTakenTime` and record a mismatch, allowing for time-zone differences.
+- Fix the causes found where the format allows it, for example by writing the date tags Google Photos reads for that format (QuickTime dates for videos, XMP for PNG).
+- Log one summary line per zip ("no date written for N files"), with per-file lines at debug level.
+- Add a `wrong-dates` report (like `large-files`, sharing `newManualFilesCmd`) listing uploaded files whose date did not take effect, with the date they should have, so the user can correct them by hand.
+
+**Done when:** after a run, every uploaded file either shows its original date in Google Photos or is listed by `wrong-dates` with the date it should have, and the log says per zip how many files had no date written and why.
+
+**Limits:**
+
+- Files already uploaded with the wrong date cannot be corrected through the API, only by hand in Google Photos ("Edit date & time"). Uploading them again would leave the wrongly dated copy in place, because the API cannot delete.
+- Files uploaded before this change have no recorded result. Checking them means listing the app's media items, which needs the read scope from item 1.
+- Sidecar times are in UTC and are written with a `+00:00` offset. The date is correct, but Google Photos may show the time in UTC rather than the local time where the photo was taken.
