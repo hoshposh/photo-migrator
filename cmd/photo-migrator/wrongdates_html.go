@@ -3,6 +3,7 @@ package main
 import (
 	"html/template"
 	"io"
+	"strconv"
 	"time"
 )
 
@@ -18,6 +19,7 @@ type wrongDatesPage struct {
 
 type wrongDatesPageRow struct {
 	ID, File, Album, URL string
+	Key                  string // media ID and when Google's date was read: a recheck changes it, clearing the tick
 	SetTo, SetToUTC      string // the date to set, in the page's zone and in UTC
 	GoogleHas            string
 	Others               []string // dates other copies of the photo expect
@@ -29,7 +31,7 @@ func printWrongDatesHTML(w io.Writer, rep dateReport, loc *time.Location, genera
 	page := wrongDatesPage{Generated: generated.In(loc).Format(htmlDateLayout), NotJudged: notJudgedText(rep)}
 	for _, d := range rep.Wrong {
 		r := wrongDatesPageRow{
-			ID: d.MediaID, File: d.File, Album: d.Album, URL: d.URL,
+			ID: d.MediaID, Key: d.MediaID + "@" + strconv.FormatInt(max(d.GoogleCheckedAt.Unix(), 0), 10), File: d.File, Album: d.Album, URL: d.URL,
 			SetTo: d.ShouldBe.In(loc).Format(htmlDateLayout), SetToUTC: d.ShouldBe.UTC().Format(wrongDateTime),
 			GoogleHas: d.GoogleHas.In(loc).Format(htmlDateLayout),
 		}
@@ -77,7 +79,7 @@ a { color: var(--accent); }
 <tbody>
 {{range .Rows -}}
 <tr>
-<td><input type="checkbox" data-id="{{.ID}}" aria-label="Done: {{.File}}"></td>
+<td><input type="checkbox" data-id="{{.Key}}" aria-label="Done: {{.File}}"></td>
 <td><span class="file">{{.File}}</span>{{if .Album}}<br><span class="muted">{{.Album}}</span>{{end}}</td>
 <td><span class="setto">{{.SetTo}}</span><br><span class="muted">{{.SetToUTC}}</span>{{range .Others}}<br><span class="muted">another copy expects {{.}}</span>{{end}}</td>
 <td>{{.GoogleHas}}</td>

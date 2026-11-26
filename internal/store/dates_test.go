@@ -323,3 +323,23 @@ func TestMigration00008_GoogleURL(t *testing.T) {
 		t.Errorf("GetDateRows = %+v, want the one row with no URL", rows)
 	}
 }
+
+// Break caught: storing a link on its own also marking the photo as checked
+// (which would hide it from the next date fetch) or touching its date.
+func TestSetGoogleURL_OnlyTheLink(t *testing.T) {
+	st := openTestStore(t)
+	mustExec(t, st, `INSERT INTO media_items (source_path, status, photos_media_id) VALUES
+		('a', 'complete', 'm-1'), ('b', 'complete', 'm-1'), ('c', 'complete', 'm-2')`)
+	if err := st.SetGoogleURL("m-1", "https://photos.google.com/lr/photo/x"); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"a", "b"} {
+		r := dateRowByPath(t, st, p)
+		if r.GoogleURL != "https://photos.google.com/lr/photo/x" || !r.GoogleCheckedAt.IsZero() || !r.GoogleTime.IsZero() || r.GoogleMissing {
+			t.Errorf("%s = %+v, want only the link set", p, r)
+		}
+	}
+	if r := dateRowByPath(t, st, "c"); r.GoogleURL != "" {
+		t.Errorf("c was touched: %+v", r)
+	}
+}

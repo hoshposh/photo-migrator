@@ -358,10 +358,12 @@ links from Google in the same run. `--format html` writes one self-contained
 page, with no network use except those links: one row per photo with a
 checkbox, the file name and album, the date to set in this computer's time
 zone (with its offset) and in UTC, Google's current date, and an **Open in
-Google Photos** link. Ticks are remembered in the browser's local storage (per
-page location), so you can work through the list over several sittings; a
-counter shows how many are done. Regenerate the page with
-`wrong-dates --recheck --format html > wrong-dates.html` after fixing some.
+Google Photos** link. Ticks are stored in this browser's local storage (for a
+local file, which browser and file location share them can vary), so you can
+work through the list over several sittings; a counter shows how many are
+done. Ticks are tied to when Google's date was last read, so regenerate the
+page with `wrong-dates --recheck --format html > wrong-dates.html` after
+fixing some: photos still listed come back unticked.
 
 To fix a photo, open it from its link (or find it in Google Photos) and choose
 **⋮ → Edit date & time**. Then run `wrong-dates --recheck`: it asks Google

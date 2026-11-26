@@ -159,6 +159,11 @@ func (b *batcher) send(albumID string, group []uploaded) {
 				if err := b.p.store.SetGoogleDates(g, time.Now()); err != nil {
 					u.log.Debug("record Google date", zap.Error(err))
 				}
+			} else if r.ProductURL != "" {
+				// No date to record, but the link is still worth keeping.
+				if err := b.p.store.SetGoogleURL(r.MediaItemID, r.ProductURL); err != nil {
+					u.log.Debug("record Google link", zap.Error(err))
+				}
 			}
 			u.log.Info("✓ uploaded", zap.String("mediaID", r.MediaItemID))
 		}

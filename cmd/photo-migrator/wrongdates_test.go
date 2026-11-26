@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -990,7 +991,7 @@ func TestWrongDates_HTML(t *testing.T) {
 		"no link",
 		`&lt;b&gt;&amp;`,
 		"29 Jul 2018, 2:17 PM (GMT-04:00)", "2018-07-29 18:17 UTC",
-		`data-id="m-a"`, `data-id="m-b"`,
+		`data-id="m-a@`, `data-id="m-b@`,
 		"photo-migrator-wrong-dates",
 	} {
 		if !strings.Contains(out, want) {
@@ -1040,5 +1041,43 @@ func TestWrongDates_FormatRejected(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q lacks %q", err, want)
 		}
+	}
+}
+
+// Break caught: a tick surviving a --recheck for a photo whose fix did not
+// stick (the key must change when Google's date is read again), or ticks being
+// lost when the page is regenerated without asking Google.
+func TestPrintWrongDatesHTML_TickKeyFollowsCheckTime(t *testing.T) {
+	key := func(checked time.Time) string {
+		rep := dateReport{Wrong: []wrongDate{{MediaID: "m-1", File: "a.jpg", ShouldBe: wdTaken, GoogleHas: wdGoogle, GoogleCheckedAt: checked}}}
+		var b bytes.Buffer
+		if err := printWrongDatesHTML(&b, rep, time.UTC, wdGoogle); err != nil {
+			t.Fatal(err)
+		}
+		m := regexp.MustCompile(`data-id="([^"]*)"`).FindStringSubmatch(b.String())
+		if m == nil {
+			t.Fatalf("no data-id in:\n%s", b.String())
+		}
+		return m[1]
+	}
+	t1, t2 := time.Unix(1_800_000_000, 0), time.Unix(1_800_000_500, 0)
+	if key(t1) == key(t2) {
+		t.Errorf("same key %q for different check times", key(t1))
+	}
+	first, again := key(t1), key(time.Unix(1_800_000_000, 0))
+	if first != again || !strings.HasPrefix(first, "m-1@") {
+		t.Errorf("keys = %q, %q, want equal and m-1@<time>", first, again)
+	}
+}
+
+// Break caught: a link with a script scheme being written into the page.
+func TestPrintWrongDatesHTML_FiltersLinkScheme(t *testing.T) {
+	rep := dateReport{Wrong: []wrongDate{{MediaID: "m-1", File: "a.jpg", ShouldBe: wdTaken, GoogleHas: wdGoogle, URL: "javascript:alert(1)"}}}
+	var b bytes.Buffer
+	if err := printWrongDatesHTML(&b, rep, time.UTC, wdGoogle); err != nil {
+		t.Fatal(err)
+	}
+	if out := b.String(); !strings.Contains(out, "#ZgotmplZ") || strings.Contains(out, "javascript:") {
+		t.Errorf("unsafe scheme not filtered:\n%s", out)
 	}
 }

@@ -110,6 +110,13 @@ func (s *Store) SetTakenDates(ds []TakenDate) error {
 	return tx.Commit()
 }
 
+// SetGoogleURL stores only the link of a media ID, on every row with that ID,
+// without recording a date or marking the item checked.
+func (s *Store) SetGoogleURL(mediaID, url string) error {
+	_, err := s.db.Exec(`UPDATE media_items SET google_url = ? WHERE photos_media_id = ?`, url, mediaID)
+	return err
+}
+
 // SetGoogleDates records Google's answer for each media ID in one
 // transaction, on every row with that ID (Google dedupes identical uploads).
 // An empty URL leaves a stored link alone.

@@ -55,6 +55,7 @@ type wrongDate struct {
 	OtherExpected                              []time.Time // other rows' dates > 24 h from ShouldBe
 	Copies                                     []dateCopy  // every row for this media ID
 	URL                                        string      // opens the photo in Google Photos; "" = unknown
+	GoogleCheckedAt                            time.Time   // latest time Google's date was read for this media ID
 }
 
 type dateCopy struct{ SourceZip, InZipPath, Album string }
@@ -163,6 +164,9 @@ func judgeDates(rows []store.DateRow) dateReport {
 		for _, r := range g {
 			if w.URL == "" {
 				w.URL = r.GoogleURL
+			}
+			if r.GoogleCheckedAt.After(w.GoogleCheckedAt) {
+				w.GoogleCheckedAt = r.GoogleCheckedAt
 			}
 			w.Copies = append(w.Copies, dateCopy{r.SourceZip, rowEntry(r), r.AlbumName})
 			if r.TakenSource == store.TakenFromSidecar && absDuration(r.TakenTime.Sub(w.ShouldBe)) > wrongDateThreshold {
