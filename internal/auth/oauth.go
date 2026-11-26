@@ -46,22 +46,29 @@ func LoadConfig(credentialsPath string) (*oauth2.Config, error) {
 
 // GetClient returns an authenticated *http.Client for the Google Photos API.
 //
-// On the first call it runs the loopback OAuth2 flow (opens a browser window)
-// and caches the resulting token to ~/.config/photo-migrator/token.json.
-// Subsequent calls load the cached token, refreshing it automatically when
-// it expires.
+// It uses the token cached at ~/.config/photo-migrator/token.json, refreshing
+// it automatically when it expires. If there is no cached token it signs in
+// first (see Login).
 func GetClient(ctx context.Context, cfg *oauth2.Config) (*http.Client, error) {
 	tokenPath, err := tokenCachePath()
 	if err != nil {
 		return nil, err
 	}
-
-	// Use the cached token if available.
 	if tok, err := loadToken(tokenPath); err == nil {
 		return cfg.Client(ctx, tok), nil
 	}
+	return Login(ctx, cfg)
+}
 
-	// Run the interactive loopback flow.
+// Login always runs the browser sign-in, ignoring any cached token, and
+// replaces token.json with the result. This is what `photo-migrator auth`
+// does, so re-running it fixes a token Google has rejected (for example the
+// 7-day expiry for apps in Testing mode).
+func Login(ctx context.Context, cfg *oauth2.Config) (*http.Client, error) {
+	tokenPath, err := tokenCachePath()
+	if err != nil {
+		return nil, err
+	}
 	tok, err := runLoopbackFlow(ctx, cfg)
 	if err != nil {
 		return nil, err

@@ -3,6 +3,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"sync"
 
@@ -61,7 +62,23 @@ func (p *Pool) DryRun() bool { return p.cfg.DryRun }
 // is closed or ctx is cancelled. It blocks until all workers have exited.
 // Cancelling ctx stops new uploads from starting; uploads already in flight
 // run to completion.
-func (p *Pool) Run(ctx context.Context, jobs <-chan Job) {
+//
+// If Google rejects the sign-in (photos.ErrAuthFailed), every worker stops,
+// the affected items stay pending, and Run returns that error.
+func (p *Pool) Run(ctx context.Context, jobs <-chan Job) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var (
+		fatalOnce sync.Once
+		fatal     error
+	)
+	stop := func(err error) {
+		fatalOnce.Do(func() {
+			fatal = err
+			cancel()
+		})
+	}
+
 	var wg sync.WaitGroup
 	for i := 0; i < p.cfg.Workers; i++ {
 		wg.Add(1)
@@ -75,15 +92,16 @@ func (p *Pool) Run(ctx context.Context, jobs <-chan Job) {
 					if !ok {
 						return
 					}
-					p.process(ctx, job)
+					p.process(ctx, job, stop)
 				}
 			}
 		}()
 	}
 	wg.Wait()
+	return fatal
 }
 
-func (p *Pool) process(ctx context.Context, job Job) {
+func (p *Pool) process(ctx context.Context, job Job, stop func(error)) {
 	log := p.cfg.Logger.With(
 		zap.String("file", filepath.Base(job.MediaPath)),
 		zap.String("album", job.AlbumName),
@@ -105,6 +123,10 @@ func (p *Pool) process(ctx context.Context, job Job) {
 	if err != nil {
 		if ctx.Err() != nil {
 			return // interrupted, not a failure: leave pending
+		}
+		if errors.Is(err, photos.ErrAuthFailed) {
+			stop(err) // not this file's fault: leave pending, stop the run
+			return
 		}
 		log.Error("resolve album", zap.Error(err))
 		_ = p.store.SetMediaError(job.MediaPath, "album: "+err.Error())
@@ -134,6 +156,10 @@ func (p *Pool) process(ctx context.Context, job Job) {
 	// and recording a spurious failure. A second Ctrl+C exits the process.
 	mediaID, err := p.client.UploadMedia(context.WithoutCancel(ctx), job.MediaPath, description, albumID)
 	if err != nil {
+		if errors.Is(err, photos.ErrAuthFailed) {
+			stop(err) // not this file's fault: leave pending, stop the run
+			return
+		}
 		log.Error("upload failed", zap.Error(err))
 		_ = p.store.SetMediaError(job.MediaPath, err.Error())
 		return

@@ -381,4 +381,4 @@ The tool also applies exponential backoff (up to 60 s) on 429 and 5xx responses 
 | `batchCreate item error: The caller does not have permission` | Your Google Cloud project may need Photos Library API access approval; check the OAuth consent screen and ensure Account B is listed as a test user |
 | `byte upload: open media file: no such file or directory` | The staging directory was cleaned up; re-run `run` to re-extract and retry |
 | `byte upload HTTP 413` | The file exceeds the ~200 MB API limit; run `photo-migrator large-files --extract <dir>` and upload manually via [photos.google.com](https://photos.google.com/) |
-| Token expired after 7 days | Re-run `photo-migrator auth`; the 7-day limit applies to apps in Testing mode |
+| `google rejected the saved sign-in` / `invalid_grant` | Your saved sign-in has expired or been revoked (apps in Testing mode expire after 7 days). The run stops at the first such error and leaves the remaining files pending. Run `photo-migrator auth` to sign in again, then re-run `run`. |

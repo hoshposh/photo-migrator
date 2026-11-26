@@ -8,6 +8,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -151,5 +154,55 @@ func TestLoopbackFlow_StateIsUnpredictable(t *testing.T) {
 			t.Errorf("state %q repeated across flows", s)
 		}
 		seen[s] = true
+	}
+}
+
+// Break caught: `photo-migrator auth` reusing a saved token that Google has
+// since rejected (e.g. the 7-day expiry in Testing mode), so re-running auth
+// never fixes "invalid_grant".
+func TestLogin_SignsInAgainDespiteCachedToken(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	tokenPath := filepath.Join(home, ".config", "photo-migrator", "token.json")
+	if err := os.MkdirAll(filepath.Dir(tokenPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tokenPath, []byte(`{"access_token":"stale","refresh_token":"revoked"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := (&fakeGoogle{}).server(t)
+	cfg := &oauth2.Config{
+		ClientID:     "client-id",
+		ClientSecret: "client-secret",
+		Endpoint:     oauth2.Endpoint{AuthURL: "https://accounts.example/auth", TokenURL: srv.URL},
+	}
+	browserOpened := false
+	orig := openBrowser
+	openBrowser = func(rawURL string) {
+		browserOpened = true
+		u, _ := url.Parse(rawURL)
+		cb, _ := url.Parse(u.Query().Get("redirect_uri"))
+		cb.RawQuery = honestBrowser(u.Query()).Encode()
+		go func() {
+			if resp, err := http.Get(cb.String()); err == nil {
+				_ = resp.Body.Close()
+			}
+		}()
+	}
+	t.Cleanup(func() { openBrowser = orig })
+
+	if _, err := Login(context.Background(), cfg); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	if !browserOpened {
+		t.Error("Login reused the cached token instead of signing in again")
+	}
+	saved, err := os.ReadFile(tokenPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(saved), `"access_token":"at"`) {
+		t.Errorf("token.json was not replaced with the new token: %s", saved)
 	}
 }

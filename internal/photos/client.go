@@ -3,12 +3,20 @@ package photos
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
+
+	"golang.org/x/oauth2"
 )
 
 const baseURL = "https://photoslibrary.googleapis.com/v1"
+
+// ErrAuthFailed reports that Google rejected the saved sign-in (for example
+// an expired or revoked refresh token, "invalid_grant"). Retrying cannot fix
+// it, and every later request would fail the same way, so callers should stop.
+var ErrAuthFailed = errors.New("google rejected the saved sign-in")
 
 // Client wraps the Google Photos Library API.
 type Client struct {
@@ -42,6 +50,11 @@ func (c *Client) doWithRetry(ctx context.Context, req *http.Request) (*http.Resp
 
 		resp, err := c.http.Do(req.WithContext(ctx))
 		if err != nil {
+			// The token refresh was rejected: not transient, don't retry.
+			var rerr *oauth2.RetrieveError
+			if errors.As(err, &rerr) {
+				return nil, fmt.Errorf("%w (%w); run 'photo-migrator auth' to sign in again", ErrAuthFailed, err)
+			}
 			// Network error — retry if we have attempts left.
 			if attempt < maxRetries {
 				if waitErr := sleepOrCancel(ctx, backoff); waitErr != nil {

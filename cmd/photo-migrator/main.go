@@ -199,7 +199,7 @@ Prerequisites — see README.md for step-by-step instructions:
 			if err != nil {
 				return credentialErr(credPath, err)
 			}
-			client, err := auth.GetClient(context.Background(), oauthCfg)
+			client, err := auth.Login(context.Background(), oauthCfg)
 			if err != nil {
 				return fmt.Errorf("authorization failed: %w", err)
 			}
@@ -917,6 +917,11 @@ func processZips(ctx context.Context, zips []string, stagingDir string, st *stor
 		if ctx.Err() != nil {
 			return interrupted(ctx, zipPath, setZipStatus, logger)
 		}
+		if errors.Is(uploadErr, photos.ErrAuthFailed) {
+			// Not this zip's fault: leave it pending and stop the whole run.
+			_ = setZipStatus(zipPath, store.StatusPending, "")
+			return uploadErr
+		}
 		if uploadErr != nil {
 			logger.Error("upload phase failed", zap.String("zip", zipPath), zap.Error(uploadErr))
 			_ = setZipStatus(zipPath, store.StatusError, uploadErr.Error())
@@ -959,9 +964,14 @@ func processDirectory(ctx context.Context, dir, sourceZip string, st *store.Stor
 	jobs := make(chan pipeline.Job, 200)
 	walkErr := make(chan error, 1)
 
+	// The walker gets its own context so it can be released if the pool
+	// stops early (fatal error) and nothing is left to drain the channel.
+	walkCtx, cancelWalk := context.WithCancel(ctx)
+	defer cancelWalk()
+
 	go func() {
 		defer close(jobs)
-		err := takeout.WalkDirectory(ctx, dir, sourceZip, st.IsUploaded, func(j takeout.MigrationJob) {
+		err := takeout.WalkDirectory(walkCtx, dir, sourceZip, st.IsUploaded, func(j takeout.MigrationJob) {
 			// Register in DB before handing off to the worker pool. Skipped on
 			// dry runs: rows are keyed by (staging) path, and rows a real run
 			// never revisits would keep their zip incomplete forever.
@@ -972,16 +982,23 @@ func processDirectory(ctx context.Context, dir, sourceZip string, st *store.Stor
 			}
 			select {
 			case jobs <- pipeline.Job{MigrationJob: j}:
-			case <-ctx.Done():
+			case <-walkCtx.Done():
 			}
 		}, logger)
 		walkErr <- err
 	}()
 
-	pool.Run(ctx, jobs)
+	poolErr := pool.Run(ctx, jobs)
+	cancelWalk()
+	werr := <-walkErr
 
-	if err := <-walkErr; err != nil {
-		return fmt.Errorf("walk directory: %w", err)
+	switch {
+	case poolErr != nil:
+		return poolErr
+	case ctx.Err() != nil:
+		return ctx.Err() // interrupted
+	case werr != nil:
+		return fmt.Errorf("walk directory: %w", werr)
 	}
 	return nil
 }
@@ -1001,6 +1018,8 @@ func uploadFromDB(ctx context.Context, st *store.Store, pool *pipeline.Pool, log
 	logger.Info("uploading from database", zap.Int("pending", len(items)))
 
 	jobs := make(chan pipeline.Job, 200)
+	prodCtx, cancelProd := context.WithCancel(ctx)
+	defer cancelProd() // release the producer if the pool stops early
 	go func() {
 		defer close(jobs)
 		for _, item := range items {
@@ -1015,13 +1034,15 @@ func uploadFromDB(ctx context.Context, st *store.Store, pool *pipeline.Pool, log
 					Sidecar:     sidecar,
 				},
 			}:
-			case <-ctx.Done():
+			case <-prodCtx.Done():
 				return
 			}
 		}
 	}()
 
-	pool.Run(ctx, jobs)
+	if err := pool.Run(ctx, jobs); err != nil {
+		return err
+	}
 	return ctx.Err() // non-nil only if interrupted
 }
 

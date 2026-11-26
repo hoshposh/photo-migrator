@@ -21,6 +21,7 @@ import (
 
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
+	"golang.org/x/oauth2"
 
 	"github.com/hoshposh/photo-migrator/internal/photos"
 	"github.com/hoshposh/photo-migrator/internal/pipeline"
@@ -527,5 +528,97 @@ func TestWithSignals_SecondSignalQuitsImmediately(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("second SIGINT did not quit")
+	}
+}
+
+// Break caught: a rejected sign-in (invalid_grant) being retried for about a
+// minute per file and then recorded as a failure for every file and zip,
+// instead of stopping the run with a pointer to `photo-migrator auth`.
+func TestProcessZips_StopsOnRejectedSignIn(t *testing.T) {
+	var tokenCalls, apiCalls atomic.Int32
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			tokenCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":"invalid_grant","error_description":"Bad Request"}`)
+			return
+		}
+		apiCalls.Add(1)
+		http.NotFound(w, r)
+	}))
+	defer fake.Close()
+	target, _ := url.Parse(fake.URL)
+
+	// A saved token that has expired and whose refresh Google rejects.
+	ctx := context.WithValue(context.Background(), oauth2.HTTPClient, &http.Client{Transport: rewriteTransport{target}})
+	cfg := &oauth2.Config{ClientID: "id", ClientSecret: "secret", Endpoint: oauth2.Endpoint{TokenURL: "https://oauth2.example/token"}}
+	expired := &oauth2.Token{AccessToken: "old", RefreshToken: "revoked", Expiry: time.Now().Add(-time.Hour)}
+	client := photos.New(cfg.Client(ctx, expired))
+
+	takeoutDir := t.TempDir()
+	zip1 := writeTakeoutZip(t, takeoutDir, "takeout-001.zip")
+	zip2 := writeTakeoutZip(t, takeoutDir, "takeout-002.zip")
+	dbPath := filepath.Join(t.TempDir(), "m.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	for _, z := range []string{zip1, zip2} {
+		if err := st.RegisterZip(z); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	logger := zap.NewNop()
+	pool := pipeline.NewPool(pipeline.Config{Workers: 2, RateLimit: 1000, Logger: logger}, client, st)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- processZips(context.Background(), []string{zip1, zip2}, t.TempDir(), st, pool, logger)
+	}()
+	var runErr error
+	select {
+	case runErr = <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("run did not stop promptly on a rejected sign-in (retrying?)")
+	}
+
+	if !errors.Is(runErr, photos.ErrAuthFailed) {
+		t.Fatalf("error = %v, want photos.ErrAuthFailed", runErr)
+	}
+	if !strings.Contains(runErr.Error(), "photo-migrator auth") {
+		t.Errorf("error does not tell the user to run `photo-migrator auth`: %v", runErr)
+	}
+	if n := apiCalls.Load(); n != 0 {
+		t.Errorf("Photos API called %d times without a valid sign-in", n)
+	}
+
+	stats, err := st.GetStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.ErrorMedia != 0 {
+		t.Errorf("error media = %d, want 0 (sign-in failure is not a file failure)", stats.ErrorMedia)
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	rows, err := db.Query(`SELECT zip_path, status, COALESCE(error_msg, '') FROM zip_archives`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var p, status, msg string
+		if err := rows.Scan(&p, &status, &msg); err != nil {
+			t.Fatal(err)
+		}
+		if status != "pending" || msg != "" {
+			t.Errorf("%s = (%q, %q), want (\"pending\", \"\")", filepath.Base(p), status, msg)
+		}
 	}
 }
