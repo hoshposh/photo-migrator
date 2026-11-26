@@ -128,3 +128,55 @@ func TestMigration_IdentifiesZipItemsByEntryAndMergesDuplicates(t *testing.T) {
 		}
 	}
 }
+
+// Break caught: files the old dry-run bug marked complete (media ID
+// "dry-run", never actually uploaded) staying complete forever, along with
+// their zips, so those photos are silently never migrated.
+func TestMigration_ResetsFalseDryRunCompletions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "m.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	goose.SetBaseFS(embedMigrations)
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		t.Fatal(err)
+	}
+	goose.SetLogger(goose.NopLogger())
+	if err := goose.UpTo(db, "migrations", 3); err != nil {
+		t.Fatal(err)
+	}
+	const dryZip, realZip = "/t/takeout-001.zip", "/t/takeout-002.zip"
+	if _, err := db.Exec(`INSERT INTO zip_archives (zip_path, status) VALUES (?, 'complete'), (?, 'complete')`, dryZip, realZip); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO media_items (source_path, source_zip, zip_entry, status, photos_media_id) VALUES
+		('/s/takeout-001/a.jpg', ?, 'a.jpg', 'complete', 'dry-run'),
+		('/s/takeout-002/b.jpg', ?, 'b.jpg', 'complete', 'AO7vpWreal')`, dryZip, realZip); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open (applies later migrations): %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	check := func(q string, arg, want string) {
+		t.Helper()
+		var got sql.NullString
+		if err := st.db.QueryRow(q, arg).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got.String != want {
+			t.Errorf("%s [%s] = %q, want %q", q, arg, got.String, want)
+		}
+	}
+	check(`SELECT status FROM media_items WHERE zip_entry = ?`, "a.jpg", "pending")
+	check(`SELECT photos_media_id FROM media_items WHERE zip_entry = ?`, "a.jpg", "")
+	check(`SELECT status FROM zip_archives WHERE zip_path = ?`, dryZip, "pending")
+	check(`SELECT status FROM media_items WHERE zip_entry = ?`, "b.jpg", "complete")
+	check(`SELECT photos_media_id FROM media_items WHERE zip_entry = ?`, "b.jpg", "AO7vpWreal")
+	check(`SELECT status FROM zip_archives WHERE zip_path = ?`, realZip, "complete")
+}
