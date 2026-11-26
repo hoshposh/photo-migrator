@@ -113,3 +113,23 @@ Every command that changes the database should:
 - Files below the threshold keep the current single-request upload.
 
 **Limits:** Google keeps resumable sessions only for a limited time (check the current documentation for how long), so a migration paused for longer restarts those files from zero. Chunked uploads make more requests per large file, which `rate-limit` counts.
+
+### 6. Pixel RAW + JPEG pairs appear as two photos
+
+**Problem:** Pixel phones save a RAW shot as a JPEG (`PXL_x.RAW-01.MP.COVER.jpg`, which is also a motion photo with its video in `PXL_x.RAW-01.MP.COVER`) and a DNG (`PXL_x.RAW-02.ORIGINAL.dng`). On the phone, Google Photos shows the pair as one photo with a RAW badge. Through the Library API there is no way to link them, so each pair arrives as **two separate items**, the JPEG and the RAW, and the shot appears twice in the library. One real Takeout had 786 such pairs.
+
+**Approach:**
+
+- Recognise the pair by name in `takeout.Classify`: the same `PXL_<date>_<time>` stem with `.RAW-01.*.jpg` and `.RAW-02.ORIGINAL.dng`. Like motion-photo halves, this must not depend on both files being in the same zip.
+- Add a setting, for example `raw-pairs = "both" | "jpeg" | "raw"`, with `both` (the current behaviour) as the default so nothing changes unless asked:
+  - `jpeg` uploads only the JPEG, which keeps the motion and the processed look.
+  - `raw` uploads only the DNG, the larger, unprocessed original.
+- Hold back the other half with its own status (for example `raw_pair`), as `motion_video` does: it doesn't block the zip, `status` counts it, a `raw-pairs` report lists it (with `--extract`), and setting it back to `pending` releases it.
+- Log one summary line per zip ("held back N RAW-pair halves"), with per-file lines at debug level.
+
+**Done when:** with `raw-pairs = "jpeg"`, a run uploads each pair's JPEG and holds back its DNG (and the reverse with `raw`), `scan --skipped` shows how many pairs it found, and the default `both` behaves exactly as today.
+
+**Limits:**
+
+- Files already uploaded are not removed (the API cannot delete). The setting only affects files not yet uploaded, so it is worth deciding before a migration starts.
+- Holding back the DNG means the destination keeps only the processed JPEG of those shots, unless the held-back files are uploaded later by hand.
