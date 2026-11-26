@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -191,4 +192,59 @@ func readExifJSON(t *testing.T, path string) map[string]any {
 		t.Fatal("exiftool returned no results")
 	}
 	return results[0]
+}
+
+// Break caught: Takeout exports RAW photos that Google converted to JPEG
+// (storage-saver accounts) under their original .ARW/.DNG/... names;
+// exiftool refuses to write a "RAW" file whose content is JPEG, so the
+// sidecar date and GPS were never restored for them.
+func TestRestoreMetadata_JPEGWithRawExtension(t *testing.T) {
+	jpg := createTestJPEG(t)
+	arw := filepath.Join(filepath.Dir(jpg), "DSC01475.ARW")
+	if err := os.Rename(jpg, arw); err != nil {
+		t.Fatal(err)
+	}
+
+	epoch := time.Date(2017, 10, 13, 20, 1, 23, 0, time.UTC).Unix()
+	sc := &takeout.Sidecar{PhotoTakenTime: takeout.EpochTime{Timestamp: strconv.FormatInt(epoch, 10)}}
+	if err := metadata.RestoreMetadata(arw, sc); err != nil {
+		t.Fatalf("RestoreMetadata on JPEG named .ARW: %v", err)
+	}
+
+	if got := readExifJSON(t, arw)["DateTimeOriginal"]; got != "2017:10:13 20:01:23" {
+		t.Errorf("DateTimeOriginal = %v, want 2017:10:13 20:01:23", got)
+	}
+	entries, err := os.ReadDir(filepath.Dir(arw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "DSC01475.ARW" {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("directory holds %v, want only DSC01475.ARW (no temp files left)", names)
+	}
+}
+
+// Break caught: exiftool's multi-line output (with the full file path)
+// flooding the log for every file it cannot update.
+func TestRestoreMetadata_ErrorIsOneLine(t *testing.T) {
+	bad := filepath.Join(t.TempDir(), "broken.jpg")
+	if err := os.WriteFile(bad, []byte("not an image at all"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	epoch := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC).Unix()
+	sc := &takeout.Sidecar{PhotoTakenTime: takeout.EpochTime{Timestamp: strconv.FormatInt(epoch, 10)}}
+
+	err := metadata.RestoreMetadata(bad, sc)
+	if err == nil {
+		t.Fatal("expected an error for a file exiftool cannot write")
+	}
+	if strings.Contains(err.Error(), "\n") {
+		t.Errorf("error spans several lines:\n%v", err)
+	}
+	if strings.Contains(err.Error(), bad) {
+		t.Errorf("error repeats the full file path: %v", err)
+	}
 }

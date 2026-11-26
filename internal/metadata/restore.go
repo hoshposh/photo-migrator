@@ -4,9 +4,13 @@ package metadata
 
 import (
 	"fmt"
+	"io"
 	"math"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/hoshposh/photo-migrator/internal/takeout"
@@ -112,12 +116,87 @@ func RestoreMetadata(mediaPath string, sidecar *takeout.Sidecar) error {
 		return nil
 	}
 
-	args = append(args, mediaPath)
+	target, commit, cleanup, err := writableTarget(mediaPath)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
 
-	cmd := exec.Command("exiftool", args...)
+	// -overwrite_original (not _in_place) makes exiftool write a new file and
+	// rename it over target; when target is a hard link, the original file is
+	// left untouched until commit renames the result over it.
+	cmd := exec.Command("exiftool", append(args, target)...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("exiftool failed: %w: %s", err, string(output))
+		return fmt.Errorf("exiftool: %s", firstLine(output, target, err))
 	}
-	return nil
+	return commit()
+}
+
+// writableTarget returns the path exiftool should write. Normally that is
+// mediaPath itself. But Takeout exports RAW photos that Google converted to
+// JPEG (storage-saver accounts) under their original .ARW/.DNG/... names, and
+// exiftool refuses to write a "RAW" file whose content is JPEG. For those it
+// returns a temporary hard link (or copy) with a .jpg name; commit renames
+// the updated file back over mediaPath, and cleanup removes any leftover.
+func writableTarget(mediaPath string) (target string, commit func() error, cleanup func(), err error) {
+	noop := func() error { return nil }
+	ext := strings.ToLower(filepath.Ext(mediaPath))
+	if ext == ".jpg" || ext == ".jpeg" || !isJPEG(mediaPath) {
+		return mediaPath, noop, func() {}, nil
+	}
+	tmp := mediaPath + ".photo-migrator.jpg"
+	_ = os.Remove(tmp) // stale leftover from an interrupted run
+	if err := os.Link(mediaPath, tmp); err != nil {
+		if err := copyFile(mediaPath, tmp); err != nil { // e.g. exFAT: no hard links
+			return "", nil, nil, fmt.Errorf("prepare %s for exiftool: %w", filepath.Base(mediaPath), err)
+		}
+	}
+	return tmp, func() error { return os.Rename(tmp, mediaPath) }, func() { _ = os.Remove(tmp) }, nil
+}
+
+// isJPEG reports whether the file starts with the JPEG signature FF D8 FF.
+func isJPEG(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+	var b [3]byte
+	if _, err := io.ReadFull(f, b[:]); err != nil {
+		return false
+	}
+	return b == [3]byte{0xFF, 0xD8, 0xFF}
+}
+
+func copyFile(src, dst string) (err error) {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = in.Close() }()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := out.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
+	_, err = io.Copy(out, in)
+	return err
+}
+
+// firstLine condenses exiftool's output to its first message, without the
+// file path it appends, so a failure is one readable log line.
+func firstLine(output []byte, path string, runErr error) string {
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		return strings.TrimSpace(strings.TrimSuffix(line, " - "+path))
+	}
+	return runErr.Error()
 }
