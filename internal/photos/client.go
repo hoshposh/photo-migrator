@@ -6,9 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
+	"sync"
 	"time"
 
 	"golang.org/x/oauth2"
+	"golang.org/x/time/rate"
 )
 
 const baseURL = "https://photoslibrary.googleapis.com/v1"
@@ -18,16 +21,43 @@ const baseURL = "https://photoslibrary.googleapis.com/v1"
 // it, and every later request would fail the same way, so callers should stop.
 var ErrAuthFailed = errors.New("google rejected the saved sign-in")
 
-// Client wraps the Google Photos Library API.
+// maxRetryAfter caps how long a Retry-After header can make a request wait.
+const maxRetryAfter = 2 * time.Minute
+
+// Client wraps the Google Photos Library API. It is safe for concurrent use.
 type Client struct {
 	http    *http.Client
 	baseURL string
+	// limiter, if set, gates every HTTP request (including retries), so the
+	// configured rate is requests per second, not files per second.
+	limiter *rate.Limiter
+	// batchMu serialises batchCreate calls: Google's upload guide says
+	// batchCreate for one user must be called one at a time, and concurrent
+	// calls are answered with HTTP 429. Byte uploads stay parallel.
+	batchMu sync.Mutex
 }
 
 // New returns a Client that uses the provided *http.Client (which must already
 // carry OAuth2 credentials via its Transport).
-func New(httpClient *http.Client) *Client {
-	return &Client{http: httpClient, baseURL: baseURL}
+func New(httpClient *http.Client, opts ...Option) *Client {
+	c := &Client{http: httpClient, baseURL: baseURL}
+	for _, o := range opts {
+		o(c)
+	}
+	return c
+}
+
+// Option configures a Client.
+type Option func(*Client)
+
+// WithRateLimit limits the client to perSecond API requests per second,
+// counting every request and retry. perSecond <= 0 means no limit.
+func WithRateLimit(perSecond float64) Option {
+	return func(c *Client) {
+		if perSecond > 0 {
+			c.limiter = rate.NewLimiter(rate.Limit(perSecond), 1)
+		}
+	}
 }
 
 // doWithRetry executes an HTTP request, retrying with exponential backoff on
@@ -48,6 +78,11 @@ func (c *Client) doWithRetry(ctx context.Context, req *http.Request) (*http.Resp
 			req.Body = body
 		}
 
+		if c.limiter != nil {
+			if err := c.limiter.Wait(ctx); err != nil {
+				return nil, err
+			}
+		}
 		resp, err := c.http.Do(req.WithContext(ctx))
 		if err != nil {
 			// The token refresh was rejected: not transient, don't retry.
@@ -72,7 +107,12 @@ func (c *Client) doWithRetry(ctx context.Context, req *http.Request) (*http.Resp
 			if attempt == maxRetries {
 				return nil, fmt.Errorf("max retries exceeded: HTTP %d", resp.StatusCode)
 			}
-			if waitErr := sleepOrCancel(ctx, backoff); waitErr != nil {
+			// Wait at least as long as Google asks (Retry-After), if it does.
+			wait := backoff
+			if ra := retryAfter(resp.Header.Get("Retry-After"), time.Now()); ra > wait {
+				wait = minDuration(ra, maxRetryAfter)
+			}
+			if waitErr := sleepOrCancel(ctx, wait); waitErr != nil {
 				return nil, waitErr
 			}
 			backoff = minDuration(backoff*2, 60*time.Second)
@@ -81,6 +121,21 @@ func (c *Client) doWithRetry(ctx context.Context, req *http.Request) (*http.Resp
 		}
 	}
 	return nil, fmt.Errorf("unreachable")
+}
+
+// retryAfter parses a Retry-After header value, either delay-seconds or an
+// HTTP date, returning 0 if it is absent or invalid.
+func retryAfter(v string, now time.Time) time.Duration {
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil && t.After(now) {
+		return t.Sub(now)
+	}
+	return 0
 }
 
 func sleepOrCancel(ctx context.Context, d time.Duration) error {

@@ -118,7 +118,12 @@ type batchCreateResp struct {
 
 // BatchCreate submits up to 50 media items for creation in a single API call.
 // albumID may be empty to upload to the library root.
+//
+// Calls are serialised across goroutines (see Client.batchMu).
 func (c *Client) BatchCreate(ctx context.Context, albumID string, items []newMediaItem) ([]BatchCreateResult, error) {
+	c.batchMu.Lock()
+	defer c.batchMu.Unlock()
+
 	payload, err := json.Marshal(batchCreateReq{
 		AlbumID:       albumID,
 		NewMediaItems: items,

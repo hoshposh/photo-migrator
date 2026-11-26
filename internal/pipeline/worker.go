@@ -9,7 +9,6 @@ import (
 
 	"go.uber.org/zap"
 	"golang.org/x/sync/singleflight"
-	"golang.org/x/time/rate"
 
 	"github.com/hoshposh/photo-migrator/internal/metadata"
 	"github.com/hoshposh/photo-migrator/internal/photos"
@@ -26,8 +25,6 @@ type Job struct {
 type Config struct {
 	// Workers is the number of concurrent upload goroutines.
 	Workers int
-	// RateLimit is the maximum number of Google Photos API requests per second.
-	RateLimit float64
 	// DryRun logs planned uploads without performing them.
 	DryRun bool
 	// RestoreMetadata enables writing original date/time and GPS from
@@ -41,17 +38,15 @@ type Pool struct {
 	cfg        Config
 	client     *photos.Client
 	store      *store.Store
-	limiter    *rate.Limiter
 	albumGroup singleflight.Group // deduplicates concurrent album creation
 }
 
 // NewPool creates a Pool with the given configuration.
 func NewPool(cfg Config, client *photos.Client, st *store.Store) *Pool {
 	return &Pool{
-		cfg:     cfg,
-		client:  client,
-		store:   st,
-		limiter: rate.NewLimiter(rate.Limit(cfg.RateLimit), 1),
+		cfg:    cfg,
+		client: client,
+		store:  st,
 	}
 }
 
@@ -133,8 +128,9 @@ func (p *Pool) process(ctx context.Context, job Job, stop func(error)) {
 		return
 	}
 
-	// Rate-limit gate before each API interaction.
-	if err := p.limiter.Wait(ctx); err != nil {
+	// Last chance to stop before the upload starts (the API client applies
+	// the rate limit to each request it makes).
+	if ctx.Err() != nil {
 		return // interrupted: leave pending
 	}
 
@@ -202,10 +198,6 @@ func (p *Pool) resolveAlbum(ctx context.Context, albumName string) (string, erro
 			return "", err
 		} else if found {
 			return id, nil
-		}
-
-		if err := p.limiter.Wait(ctx); err != nil {
-			return "", err
 		}
 
 		album, err := p.client.CreateAlbum(ctx, albumName)

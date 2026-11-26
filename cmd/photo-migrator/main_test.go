@@ -445,7 +445,7 @@ func TestProcessZips_InterruptFinishesInFlightUpload(t *testing.T) {
 	}
 
 	logger := zap.NewNop()
-	pool := pipeline.NewPool(pipeline.Config{Workers: 1, RateLimit: 1000, Logger: logger}, client, st)
+	pool := pipeline.NewPool(pipeline.Config{Workers: 1, Logger: logger}, client, st)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -575,7 +575,7 @@ func TestProcessZips_StopsOnRejectedSignIn(t *testing.T) {
 	}
 
 	logger := zap.NewNop()
-	pool := pipeline.NewPool(pipeline.Config{Workers: 2, RateLimit: 1000, Logger: logger}, client, st)
+	pool := pipeline.NewPool(pipeline.Config{Workers: 2, Logger: logger}, client, st)
 
 	done := make(chan error, 1)
 	go func() {
@@ -675,7 +675,7 @@ func TestProcessZips_TooLargeFileIsNotRetried(t *testing.T) {
 		t.Fatal(err)
 	}
 	logger := zap.NewNop()
-	pool := pipeline.NewPool(pipeline.Config{Workers: 2, RateLimit: 1000, Logger: logger}, client, st)
+	pool := pipeline.NewPool(pipeline.Config{Workers: 2, Logger: logger}, client, st)
 	staging := t.TempDir()
 
 	for run := 1; run <= 2; run++ {
@@ -738,7 +738,7 @@ func TestProcessZips_StagingDirChangeDoesNotReupload(t *testing.T) {
 		t.Fatal(err)
 	}
 	logger := zap.NewNop()
-	pool := pipeline.NewPool(pipeline.Config{Workers: 1, RateLimit: 1000, Logger: logger}, client, st)
+	pool := pipeline.NewPool(pipeline.Config{Workers: 1, Logger: logger}, client, st)
 
 	for _, staging := range []string{t.TempDir(), t.TempDir()} { // two different staging dirs
 		if err := processZips(context.Background(), []string{zipPath}, staging, st, pool, logger); err != nil {
@@ -861,7 +861,7 @@ func newLockedFixture(t *testing.T) *lockedFixture {
 	fx.st = st
 	fx.staging = t.TempDir()
 	logger := zap.NewNop()
-	fx.pool = pipeline.NewPool(pipeline.Config{Workers: 2, RateLimit: 1000, Logger: logger}, client, st)
+	fx.pool = pipeline.NewPool(pipeline.Config{Workers: 2, Logger: logger}, client, st)
 	return fx
 }
 
@@ -1039,7 +1039,7 @@ func TestProcessZips_UnrecognisedVideos(t *testing.T) {
 		t.Fatal(err)
 	}
 	logger := zap.NewNop()
-	pool := pipeline.NewPool(pipeline.Config{Workers: 2, RateLimit: 1000, Logger: logger}, client, st)
+	pool := pipeline.NewPool(pipeline.Config{Workers: 2, Logger: logger}, client, st)
 	staging := t.TempDir()
 	for run := 0; run < 2; run++ {
 		if err := processZips(context.Background(), []string{zipPath}, staging, st, pool, logger); err != nil {
@@ -1161,7 +1161,7 @@ func TestProcessZips_LogsSkippedFilesPerZip(t *testing.T) {
 	}
 	core, logs := observer.New(zap.InfoLevel)
 	logger := zap.New(core)
-	pool := pipeline.NewPool(pipeline.Config{Workers: 1, RateLimit: 1000, DryRun: true, Logger: logger}, nil, st)
+	pool := pipeline.NewPool(pipeline.Config{Workers: 1, DryRun: true, Logger: logger}, nil, st)
 
 	if err := processZips(context.Background(), []string{zipPath}, t.TempDir(), st, pool, logger); err != nil {
 		t.Fatal(err)
@@ -1198,7 +1198,7 @@ func TestProcessZips_SummarisesHeldBackFilesPerZip(t *testing.T) {
 	}
 	core, logs := observer.New(zap.InfoLevel)
 	logger := zap.New(core)
-	pool := pipeline.NewPool(pipeline.Config{Workers: 1, RateLimit: 1000, Logger: logger}, nil, st)
+	pool := pipeline.NewPool(pipeline.Config{Workers: 1, Logger: logger}, nil, st)
 
 	if err := processZips(context.Background(), []string{zipPath}, t.TempDir(), st, pool, logger); err != nil {
 		t.Fatal(err)

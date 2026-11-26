@@ -407,7 +407,7 @@ and upload in a single step.`,
 			dryRun := viper.GetBool("dry-run")
 			var photosClient *photos.Client
 			if !dryRun {
-				photosClient, err = buildPhotosClient(viperPath("credentials"))
+				photosClient, err = buildPhotosClient(viperPath("credentials"), viper.GetFloat64("rate-limit"))
 				if err != nil {
 					return err
 				}
@@ -422,7 +422,6 @@ and upload in a single step.`,
 
 			pool := newPool(
 				viper.GetInt("workers"),
-				viper.GetFloat64("rate-limit"),
 				dryRun, restoreMetadata, logger, photosClient, st,
 			)
 			return runUpload(cmd.Context(), viperPath("staging-dir"), st, pool, logger)
@@ -480,7 +479,7 @@ Press Ctrl-C again to quit immediately.`,
 			dryRun := viper.GetBool("dry-run")
 			var photosClient *photos.Client
 			if !dryRun {
-				photosClient, err = buildPhotosClient(viperPath("credentials"))
+				photosClient, err = buildPhotosClient(viperPath("credentials"), viper.GetFloat64("rate-limit"))
 				if err != nil {
 					return err
 				}
@@ -493,7 +492,6 @@ Press Ctrl-C again to quit immediately.`,
 			}
 			pool := newPool(
 				viper.GetInt("workers"),
-				viper.GetFloat64("rate-limit"),
 				dryRun, restoreMetadata, logger, photosClient, st,
 			)
 			ctx, stopSignals := withSignals(cmd.Context())
@@ -1356,17 +1354,18 @@ func addUploadFlags(cmd *cobra.Command) {
 		"write original date/time and GPS from Takeout sidecar into file metadata before uploading (requires exiftool)")
 }
 
-func newPool(workers int, rateLimit float64, dryRun, restoreMetadata bool, logger *zap.Logger, client *photos.Client, st *store.Store) *pipeline.Pool {
+func newPool(workers int, dryRun, restoreMetadata bool, logger *zap.Logger, client *photos.Client, st *store.Store) *pipeline.Pool {
 	return pipeline.NewPool(pipeline.Config{
 		Workers:         workers,
-		RateLimit:       rateLimit,
 		DryRun:          dryRun,
 		RestoreMetadata: restoreMetadata,
 		Logger:          logger,
 	}, client, st)
 }
 
-func buildPhotosClient(credPath string) (*photos.Client, error) {
+// buildPhotosClient returns an authenticated client limited to rateLimit API
+// requests per second (every request and retry counts).
+func buildPhotosClient(credPath string, rateLimit float64) (*photos.Client, error) {
 	oauthCfg, err := auth.LoadConfig(credPath)
 	if err != nil {
 		return nil, credentialErr(credPath, err)
@@ -1375,7 +1374,7 @@ func buildPhotosClient(credPath string) (*photos.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("get authenticated client: %w", err)
 	}
-	return photos.New(httpClient), nil
+	return photos.New(httpClient, photos.WithRateLimit(rateLimit)), nil
 }
 
 func credentialErr(credPath string, err error) error {

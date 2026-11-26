@@ -410,7 +410,7 @@ The Google Photos API allows approximately **75 requests per 15 seconds** per us
 ./photo-migrator run ... --rate-limit 2
 ```
 
-The tool also applies exponential backoff (up to 60 s) on 429 and 5xx responses automatically.
+The limit counts every API request, including retries; each file needs two (the upload, then a `batchCreate` that adds it to the library). Files upload in parallel, but `batchCreate` calls are made one at a time, as Google requires. On `429` and `5xx` responses the tool backs off exponentially (up to 60 s), and waits longer if Google's `Retry-After` header asks it to (up to 2 minutes).
 
 ---
 
