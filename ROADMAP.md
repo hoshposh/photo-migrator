@@ -70,3 +70,24 @@ Every command that changes the database should:
 
 - These commands only change the local ledger. They cannot remove or change anything in Google Photos, because the API this tool uses has no delete operation.
 - `db check` can only compare against the zips present in `takeout-dir`. A zip that has been moved or deleted is reported as missing, and its rows are left alone.
+
+### 4. Interactive review of held-back Locked Folder files
+
+**Problem:** files from Google Photos' Locked Folder are held back from upload (status `locked`). The API cannot put them into the destination's Locked Folder, so uploading them would make private photos visible in the main library. Some may be fine to upload, but today the only way to decide is to extract them with `locked-files --extract` and inspect them by hand. There is also no way to tell the tool which ones may be uploaded.
+
+**Approach:** add an interactive review session, for example `photo-migrator locked-files --review`:
+
+- Extract the held-back files from their source zips into a private temporary directory (mode `0700`). This can reuse `takeout.ExtractFiles`, one zip at a time, so only the files under review are on disk.
+- For each file, open it in an external viewer and prompt in the terminal: **[a]pprove for upload**, **[k]eep held back**, **[n]ext** (decide later), **[q]uit**. The viewer is set by a `viewer` config key or the `PHOTO_MIGRATOR_VIEWER` environment variable; the default is the platform opener (`xdg-open` / `open`). Videos are reviewed the same way.
+- **Approve:** set the file's status back to `pending`, and put its zip back to `pending` so the next `run` checks it again (files already uploaded are still skipped). An approved file is uploaded to the library root with no album. The `run` side of this already works and is covered by `TestProcessZips_ApprovedLockedFileIsUploaded`.
+- **Keep:** record that the file was reviewed (for example a `reviewed_at` column), so later sessions show only files not yet reviewed, unless `--all` is passed.
+- Delete every extracted copy when the session ends, including on Ctrl+C, and show progress (`12 / 40 reviewed`).
+- Like the commands in item 3: refuse to run while a `run` or `upload` is using the same database, and take a backup before the first change.
+
+**Done when:** a user can step through every held-back file in a viewer and approve or keep each one. The next `run` uploads exactly the approved files, to the library root. Kept files stay held back and are not shown again by default. No extracted copies remain on disk after the session.
+
+**Limits:**
+
+- Approving uploads a file into the main library. Making it private again means using "Move to Locked Folder" in the Google Photos mobile app. The session should say so before each approval.
+- The tool cannot control what an external viewer or desktop thumbnailer caches. Image viewers and file managers may keep thumbnails (for example in `~/.cache/thumbnails`) after the extracted file has been deleted.
+- Motion photos are exported as a still image plus a separate video file. Both parts should be approved together, which depends on the tool handling motion-photo video parts at all; today they are skipped as unrecognised files.
