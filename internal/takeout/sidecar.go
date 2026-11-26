@@ -187,14 +187,6 @@ func (f *folderLookup) jsonNames() []string {
 	return f.jsons
 }
 
-// dupNumber returns the "(N)" number of a media name, or "".
-func dupNumber(base string) string {
-	if m := numberedRe.FindStringSubmatch(base); m != nil {
-		return m[2]
-	}
-	return ""
-}
-
 // jsonDupNumber returns the "(N)" number of a sidecar name, or "".
 func jsonDupNumber(name string) string {
 	if m := numberedJSONRe.FindStringSubmatch(name); m != nil {
@@ -213,13 +205,12 @@ func (f *folderLookup) find(base string) (string, *Sidecar) {
 		return base + ".json", s
 	}
 
-	// A numbered duplicate's sidecar ("….(1).json") belongs only to the media
-	// file with the same number: X.jpg must never take X(1).jpg's sidecar.
-	n := dupNumber(base)
-	sameNumber := func(json string) bool {
-		m := jsonDupNumber(json)
-		return m == "" || m == n
-	}
+	// A numbered sidecar ("<base>.….(1).json", or one titled <base>) belongs to
+	// the duplicate "<stem>(1).<ext>" of this file, never to the file itself —
+	// even when the file's own name already ends in "(N)". Strategies 3 and 4
+	// skip them; the numbered-duplicate and cut-short rules match them by
+	// number.
+	sameNumber := func(json string) bool { return jsonDupNumber(json) == "" }
 
 	// Strategy 3: any sidecar whose name starts with "<base>." — this matches
 	// the cut-down variants (<base>.supplemental-metada.json, …-me.json, …).

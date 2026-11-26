@@ -106,6 +106,22 @@ var takeoutNameCases = []takeoutNameGroup{
 		},
 	},
 	{
+		name: "own name ends in (N)",
+		sidecars: map[string]string{
+			"Screenshot_20200101-120000(1).png.supplemental-me.json":    "Screenshot_20200101-120000(1).png",
+			"Screenshot_20200101-120000(1).png.supplemental-me(1).json": "Screenshot_20200101-120000(1).png",
+			"Y(1).png.supplemental-me(1).json":                          "Y(1).png",
+		},
+		want: map[string]string{
+			// Break caught: a file whose own name ends in "(1)" taking the
+			// sidecar of its duplicate "…(1)(1).png".
+			"Screenshot_20200101-120000(1).png":    "Screenshot_20200101-120000(1).png.supplemental-me.json",
+			"Screenshot_20200101-120000(1)(1).png": "Screenshot_20200101-120000(1).png.supplemental-me(1).json",
+			// Its own sidecar is elsewhere: still never the duplicate's.
+			"Y(1).png": "",
+		},
+	},
+	{
 		name: "edited copy",
 		sidecars: map[string]string{
 			"IMG_20141108_150533.jpg.supplemental-metadata.json": "IMG_20141108_150533.jpg",

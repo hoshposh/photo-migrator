@@ -331,7 +331,10 @@ sidecar JSON (in any of the zips, since Takeout can put a sidecar in a
 different zip than its photo) and asks Google Photos for the date it assigned.
 A photo is listed when the two differ by more than 24 hours, or when copies of
 the same photo disagree about the date. Every answer is saved in the database,
-so later runs only look at new uploads and need neither the zips nor Google.
+so later runs only look at new uploads. Keep your Takeout zips, though: an
+upgrade that improves how sidecars are matched clears the saved dates, and the
+next run reads them again from the zips in `--takeout-dir` (without them,
+photos show as "not checked yet").
 
 ```
   ⚠️  Wrong Dates Report — 1 photo(s) uploaded with a date that differs from the date taken
