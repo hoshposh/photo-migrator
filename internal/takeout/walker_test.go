@@ -98,3 +98,23 @@ func TestCtxReader_StopsMidCopyWhenCancelled(t *testing.T) {
 		t.Fatalf("read after cancel error = %v, want context.Canceled", err)
 	}
 }
+
+// Break caught: Takeout's special folders becoming albums. "Archive" holds
+// photos archived in Google Photos (a state the API cannot reproduce), and
+// "Failed Videos" holds videos Google could not process; neither is a real
+// album.
+func TestAlbumFromPath(t *testing.T) {
+	root := filepath.Join("/staging", "takeout-001")
+	cases := []struct{ rel, want string }{
+		{"Takeout/Google Photos/Trip to Maine/a.jpg", "Trip to Maine"},
+		{"Takeout/Google Photos/Photos from 2019/a.jpg", ""},
+		{"Takeout/Google Photos/Archive/a.jpg", ""},
+		{"Takeout/Google Photos/Failed Videos/a.mp4", ""},
+		{"Takeout/Google Photos/a.jpg", ""},
+	}
+	for _, c := range cases {
+		if got := albumFromPath(filepath.Join(root, filepath.FromSlash(c.rel)), root); got != c.want {
+			t.Errorf("albumFromPath(%q) = %q, want %q", c.rel, got, c.want)
+		}
+	}
+}

@@ -7,7 +7,7 @@ A CLI tool to migrate a Google Photos library from one account to another using 
 - Fully **resumable** — all state is tracked in a local SQLite database; interrupted runs pick up exactly where they left off.
 - **Incremental** — download more zip files and re-run; new ones are detected and queued automatically.
 - **Idempotent** — files already uploaded are skipped, even across multiple runs.
-- **Best-effort album preservation** — named album folders are recreated in the destination account; year-based folders (`Photos from YYYY`) upload to the library root.
+- **Best-effort album preservation** — named album folders are recreated in the destination account; year-based folders (`Photos from YYYY`) and Takeout's special `Archive` and `Failed Videos` folders upload to the library root. (Archived status itself cannot be recreated through the API.)
 
 ---
 

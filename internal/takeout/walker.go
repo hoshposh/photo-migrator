@@ -17,6 +17,15 @@ import (
 // yearFolderRe matches Google Takeout year-based folders, e.g. "Photos from 2016".
 var yearFolderRe = regexp.MustCompile(`^Photos from \d{4}$`)
 
+// nonAlbumFolders are special Takeout folders that are not albums: "Archive"
+// holds photos archived in Google Photos (a state the API cannot reproduce)
+// and "Failed Videos" holds videos Google could not process. Their files go
+// to the library root, like the year folders.
+var nonAlbumFolders = map[string]bool{
+	"Archive":       true,
+	"Failed Videos": true,
+}
+
 // MigrationJob is a single media file ready for upload.
 type MigrationJob struct {
 	// MediaPath is the absolute path to the media file on disk.
@@ -239,6 +248,7 @@ func WalkDirectory(
 // Classification rules (applied after prefix stripping):
 //   - Files directly in the root (no subdirectory)  → library root (empty).
 //   - Year folders ("Photos from YYYY")              → library root (empty).
+//   - "Archive" and "Failed Videos" (nonAlbumFolders) → library root (empty).
 //   - Any other named top-level folder               → album name = folder name.
 func albumFromPath(mediaPath, extractRoot string) string {
 	rel, err := filepath.Rel(extractRoot, mediaPath)
@@ -257,8 +267,8 @@ func albumFromPath(mediaPath, extractRoot string) string {
 		return "" // file directly in the root — no album
 	}
 	top := parts[0]
-	if yearFolderRe.MatchString(top) {
-		return "" // year folder → library root
+	if yearFolderRe.MatchString(top) || nonAlbumFolders[top] {
+		return "" // year or special folder → library root
 	}
 	return top
 }
