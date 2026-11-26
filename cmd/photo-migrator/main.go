@@ -689,18 +689,33 @@ Flags:
 }
 
 func newMotionVideosCmd() *cobra.Command {
-	return newManualFilesCmd(manualReport{
+	cmd := newManualFilesCmd(manualReport{
 		use:   "motion-videos",
-		short: "List motion-photo video parts held back from upload",
-		long: `Lists the video halves of motion photos (for example PXL_x.MP or
-PXL_x.MP.COVER, exported next to the still image PXL_x.MP.jpg). The still
-image is uploaded as a normal photo, but the Google Photos API cannot rebuild
-a motion photo: its video would appear as a separate video next to the
-still. So photo-migrator holds these videos back.
+		short: "List motion-photo and Live Photo video parts held back from upload",
+		long: `Lists the video halves of motion photos and iPhone Live Photos that were
+held back: for example PXL_x.MP or PXL_x.MP.COVER next to the still image
+PXL_x.MP.jpg, or IMG_7297.MP4 next to IMG_7297.HEIC. The still image is
+uploaded as a normal photo, but the Google Photos API cannot rebuild a motion
+photo: its video would appear as a separate video next to the still. So
+photo-migrator holds these videos back.
+
+With --uploaded the command instead lists Live Photo videos that were already
+uploaded as separate videos (for example by an earlier version of this tool).
+The API cannot delete them, so remove each by hand: --format html writes a
+checklist page with a link to each video (motion-videos --uploaded --format
+html > live-videos.html). Google is asked about every video each time, so
+the ones you deleted drop off the list. A still photo in the same folder with
+the same name is what marks a video as a Live Photo half; --takeout-dir (the
+zips or the extracted folder) helps when the stills are not in the database.
+Reading from Google needs the photoslibrary.readonly.appcreateddata scope (see
+wrong-dates).
 
 Flags:
   --format json    Emit machine-readable JSON instead of a text table
-  --extract <dir>  Extract the videos from their source zips into <dir>`,
+  --format html    With --uploaded only: a checklist web page with a link to each video
+  --extract <dir>  Extract the videos from their source zips into <dir>
+  --uploaded       List the Live Photo videos already uploaded, not the held-back ones
+  --takeout-dir <dir>  with --uploaded: where the Takeout zips or folder are (or set takeout-dir in the config)`,
 		extractHelp: "extract the motion-photo videos from their source zips into this directory",
 		empty:       "  ✓ No motion-photo videos are being held back.",
 		title:       "🎞  Motion photos — %d video part(s) held back (the still images were uploaded)",
@@ -710,6 +725,46 @@ Flags:
 		},
 		query: (*store.Store).GetMotionVideos,
 	})
+	held := cmd.RunE
+	var uploaded bool
+	cmd.RunE = func(cmd *cobra.Command, args []string) (err error) {
+		format, _ := cmd.Flags().GetString("format")
+		if !uploaded {
+			if format == "html" {
+				return errors.New("--format html needs --uploaded: only the list of uploaded videos is a checklist page")
+			}
+			return held(cmd, args)
+		}
+		if cmd.Flags().Changed("extract") {
+			return errors.New("--extract lists held-back videos and cannot be used with --uploaded")
+		}
+		st, err := store.Open(viperPath("db-path"))
+		if err != nil {
+			return fmt.Errorf("open database: %w", err)
+		}
+		defer func() {
+			if cerr := st.Close(); cerr != nil && err == nil {
+				err = cerr
+			}
+		}()
+
+		ctx, stop := withSignals(cmd.Context(), func() {
+			fmt.Fprintln(os.Stderr, "\nStopping: dates already read are saved. Press Ctrl+C again to quit immediately.")
+		})
+		defer stop()
+
+		return runUploadedVideos(ctx, st, func() (*photos.Client, error) {
+			return buildPhotosClient(viperPath("credentials"), viper.GetFloat64("rate-limit"))
+		}, uploadedVideosOpts{TakeoutDir: viperPath("takeout-dir"), Format: format},
+			os.Stdout, os.Stderr, buildLogger(), time.Local, time.Now())
+	}
+	f := cmd.Flags()
+	f.BoolVar(&uploaded, "uploaded", false, "list the Live Photo videos already uploaded (to remove by hand)")
+	f.String("takeout-dir", "", "with --uploaded: directory with the Takeout .zip files or the extracted folder")
+	f.String("credentials", defaultCredentials, "path to OAuth2 credentials.json from Google Cloud Console")
+	f.Float64("rate-limit", defaultRateLimit, "max Google Photos API requests per second")
+	f.Lookup("format").Usage = "output format: text | json | html (html only with --uploaded)"
+	return cmd
 }
 
 // newManualFilesCmd builds a report command (large-files, locked-files).

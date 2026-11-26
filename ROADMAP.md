@@ -199,8 +199,8 @@ The Library API cannot change a media item's date after upload: `batchCreate` ta
 **Progress** (design: [Live Photo videos](docs/superpowers/specs/2026-11-26-live-photo-videos-design.md)):
 
 - [x] Recognise a Live Photo video half by its still, across zips
-- [ ] Hold them back during `run` (status `motion_video`) and count them in `scan --skipped`
-- [ ] `motion-videos --uploaded --format html` cleanup page for the ones already uploaded
+- [x] Hold them back during `run` (status `motion_video`) and count them in `scan --skipped`
+- [x] `motion-videos --uploaded --format html` cleanup page for the ones already uploaded
 
 **Problem:** Takeout exports an iPhone Live Photo as a still image (`IMG_7297.HEIC`) plus a short video with the same name (`IMG_7297.MP4`); older Pixel motion photos come out the same way (`MVIMG_x.jpg` + `MVIMG_x.MP4`). The tool already holds back Pixel motion-photo video halves (`….MP`, `….MP.COVER`, status `motion_video`), but it does not recognise these: each video is uploaded as a separate 1–3 second video next to its still. One real Takeout had 818 such videos. The Library API cannot rebuild a Live Photo or motion photo.
 

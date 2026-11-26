@@ -399,6 +399,16 @@ This reads the zips in place (nothing is extracted) and does not open the databa
 
 Takeout exports a motion photo (e.g. from a Pixel phone) as two files: the still image (`PXL_x.MP.jpg` or `PXL_x.RAW-01.MP.COVER.jpg`) and its video (`PXL_x.MP`, `PXL_x.MP~2` or `PXL_x.RAW-01.MP.COVER`). The still may be in a different zip from its video. The still is uploaded as a normal photo. The Google Photos API cannot rebuild a motion photo, though, so its video would appear as a separate video next to the still. These videos are therefore **held back** with status `motion_video`; `status` counts them and `motion-videos` lists them (`--extract <dir>` pulls them out).
 
+iPhone **Live Photos** come out the same way: `IMG_7297.HEIC` plus a short `IMG_7297.MP4` (or `.MOV`) with the same name in the same folder. A video with a still of the same name next to it is treated as the still's video half and held back too (the still may be in another zip, or in a zip already finished). A video with no such still is uploaded as normal.
+
+If an earlier run already uploaded such videos, they sit in the library as separate videos. The API cannot delete them, so remove them by hand with a checklist page:
+
+```bash
+./photo-migrator motion-videos --uploaded --format html > live-videos.html
+```
+
+Open the file in a browser. Each row links to the video in Google Photos; delete it there (the still is a separate item and stays) and tick the box (ticks are remembered in the browser). Google is asked about every video on each run, so videos you deleted drop off the list; `--format json` and the default text output list the same videos. Pass `--takeout-dir` (or set it in the config) if the stills are not in the database. Like `wrong-dates`, this needs the `photoslibrary.readonly.appcreateddata` scope.
+
 Other videos whose names don't end in a known extension (for example `Concert - 3.12.20`) are recognised by their content and uploaded with a matching extension added (`Concert - 3.12.20.mp4`).
 
 ---
@@ -480,7 +490,8 @@ photo-migrator wrong-dates --recheck           # ask Google again about the list
 photo-migrator wrong-dates --format html       # a checklist web page with a link to each photo
 photo-migrator locked-files                    # list Locked Folder files held back from upload
 photo-migrator locked-files --extract <dir>    # extract them to handle by hand
-photo-migrator motion-videos                   # list motion-photo video parts held back from upload
+photo-migrator motion-videos                   # list motion-photo and Live Photo video parts held back from upload
+photo-migrator motion-videos --uploaded --format html  # checklist page for Live Photo videos already uploaded
 ```
 
 Flags in brackets are optional if set in the config file. Use `--help` on any command for full flag documentation.
