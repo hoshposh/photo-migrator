@@ -650,6 +650,41 @@ func TestWrongDates_RejectedSignInIsFatal(t *testing.T) {
 	}
 }
 
+// Break caught: Google's "ID does not match any media items" (a photo kept
+// from before this tool, which the app cannot read) failing the whole chunk,
+// or hiding the other photos in it.
+func TestWrongDates_UnreadableItemInChunk(t *testing.T) {
+	f := newWDFixture(t)
+	f.addZip("takeout-001.zip", map[string]string{
+		wdTrip + "a.jpg.supplemental-metadata.json": wdSidecar("a.jpg", wdTaken),
+		wdTrip + "b.jpg.supplemental-metadata.json": wdSidecar("b.jpg", wdTaken),
+	})
+	f.upload("takeout-001.zip", wdTrip+"a.jpg", "Trip", "m-a")
+	f.upload("takeout-001.zip", wdTrip+"b.jpg", "Trip", "m-b")
+	f.google["m-a"] = wdGoogle
+	f.onReq = func(_ int, w http.ResponseWriter, _ *http.Request) bool {
+		_, _ = w.Write([]byte(`{"mediaItemResults":[` +
+			`{"mediaItem":{"id":"m-a","mediaMetadata":{"creationTime":"2026-07-03T09:41:00Z"}}},` +
+			`{"status":{"code":3,"message":"The provided ID does not match any media items."}}]}`))
+		return true
+	}
+
+	out, _, err := f.run(context.Background(), wrongDatesOpts{}, nil)
+	if err != nil {
+		t.Fatalf("code 3 must not fail the command: %v", err)
+	}
+	rows := f.rows()
+	if r := rows[wdTrip+"a.jpg"]; r.GoogleCheckedAt.IsZero() || r.GoogleMissing {
+		t.Errorf("a.jpg should be stored with Google's date: %+v", r)
+	}
+	if r := rows[wdTrip+"b.jpg"]; !r.GoogleMissing {
+		t.Errorf("b.jpg should be recorded as not readable: %+v", r)
+	}
+	if !strings.Contains(out, "1 already in your library before this tool, or deleted") {
+		t.Errorf("report lacks the not-readable count:\n%s", out)
+	}
+}
+
 // Break caught: a photo Google returned without a date being judged against
 // the zero time and listed as 2000 years wrong.
 func TestWrongDates_ZeroGoogleTimeStaysUnchecked(t *testing.T) {

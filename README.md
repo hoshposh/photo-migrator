@@ -335,8 +335,13 @@ so later runs only look at new uploads and need neither the zips nor Google.
 
   Fix each in Google Photos: open the photo → ⋮ → Edit date & time.
   Dates are shown in UTC.
-  Not judged: 41 without a sidecar date, 3 deleted or not created by this app.
+  Not judged: 41 without a sidecar date, 3 already in your library before this tool, or deleted.
 ```
+
+When an upload matches a photo already in the destination account, Google keeps
+the existing photo (with its own date) and this tool cannot read it, so such
+photos are counted as "already in your library before this tool, or deleted"
+and not judged.
 
 To fix a photo, find it in Google Photos, open it, and choose
 **⋮ → Edit date & time**.

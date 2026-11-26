@@ -379,7 +379,7 @@ func printWrongDatesText(w io.Writer, rep dateReport) {
 		what string
 	}{
 		{rep.NoSidecarDate, "without a sidecar date"},
-		{rep.NotReadable, "deleted or not created by this app"},
+		{rep.NotReadable, "already in your library before this tool, or deleted"},
 		{rep.NotChecked, "not checked yet"},
 	} {
 		if p.n > 0 {
@@ -474,7 +474,8 @@ can only be fixed by hand: open the photo in Google Photos, choose
 ⋮ → Edit date & time.
 
 Photos not judged are counted at the end: those whose sidecar has no date,
-those Google no longer returns (deleted, or not created by this app), and
+those Google does not let this tool read (already in your library before
+this tool, or deleted), and
 those not checked yet (for example a zip missing from --takeout-dir).
 
 Flags:

@@ -149,6 +149,7 @@ func TestBatchGet_ItemStatusCodes(t *testing.T) {
 		code    int
 		missing bool
 	}{
+		{3, true},
 		{5, true},
 		{7, true},
 		{14, false},

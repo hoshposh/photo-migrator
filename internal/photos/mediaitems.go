@@ -25,7 +25,12 @@ type ItemDate struct {
 }
 
 // google.rpc.Code values that mean a media item is gone or unreadable.
+// Google answers INVALID_ARGUMENT (3, "The provided ID does not match any
+// media items.") for IDs this app cannot see, for example uploads that Google
+// deduplicated against photos already in the account: it returns those
+// existing items' IDs, which the app did not create.
 const (
+	statusInvalidArgument  = 3
 	statusNotFound         = 5
 	statusPermissionDenied = 7
 )
@@ -105,13 +110,15 @@ func (c *Client) BatchGet(ctx context.Context, ids []string) ([]ItemDate, error)
 			dates[i] = d
 			continue
 		}
-		// Only NOT_FOUND and PERMISSION_DENIED mean the item is gone or not
-		// readable by this app. Anything else may be transient, so fail the
-		// batch rather than let the caller record the item as missing.
+		// Only these codes mean the item is gone or not readable by this
+		// app. Anything else may be transient, so fail the batch rather than
+		// let the caller record the item as missing.
 		if r.Status == nil {
 			return nil, fmt.Errorf("batchGet: item %s: result has neither a media item nor a status", id)
 		}
-		if r.Status.Code != statusNotFound && r.Status.Code != statusPermissionDenied {
+		switch r.Status.Code {
+		case statusInvalidArgument, statusNotFound, statusPermissionDenied:
+		default:
 			return nil, fmt.Errorf("batchGet: item %s: status code %d: %s", id, r.Status.Code, r.Status.Message)
 		}
 		d.Missing, d.Status = true, r.Status.Message
