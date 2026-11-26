@@ -59,6 +59,8 @@ func (p *Pool) DryRun() bool { return p.cfg.DryRun }
 
 // Run starts cfg.Workers goroutines that consume from jobs until the channel
 // is closed or ctx is cancelled. It blocks until all workers have exited.
+// Cancelling ctx stops new uploads from starting; uploads already in flight
+// run to completion.
 func (p *Pool) Run(ctx context.Context, jobs <-chan Job) {
 	var wg sync.WaitGroup
 	for i := 0; i < p.cfg.Workers; i++ {
@@ -87,6 +89,11 @@ func (p *Pool) process(ctx context.Context, job Job) {
 		zap.String("album", job.AlbumName),
 	)
 
+	// Interrupted before this job started: leave it pending for the next run.
+	if ctx.Err() != nil {
+		return
+	}
+
 	// Dry run leaves the item pending so a later real run still uploads it.
 	if p.cfg.DryRun {
 		log.Info("dry-run: would upload")
@@ -96,6 +103,9 @@ func (p *Pool) process(ctx context.Context, job Job) {
 	// Resolve (or create) the destination album.
 	albumID, err := p.resolveAlbum(ctx, job.AlbumName)
 	if err != nil {
+		if ctx.Err() != nil {
+			return // interrupted, not a failure: leave pending
+		}
 		log.Error("resolve album", zap.Error(err))
 		_ = p.store.SetMediaError(job.MediaPath, "album: "+err.Error())
 		return
@@ -103,7 +113,7 @@ func (p *Pool) process(ctx context.Context, job Job) {
 
 	// Rate-limit gate before each API interaction.
 	if err := p.limiter.Wait(ctx); err != nil {
-		return // context cancelled
+		return // interrupted: leave pending
 	}
 
 	// Build optional description from sidecar.
@@ -119,8 +129,10 @@ func (p *Pool) process(ctx context.Context, job Job) {
 		}
 	}
 
-	// Two-step upload: byte stream → batchCreate.
-	mediaID, err := p.client.UploadMedia(ctx, job.MediaPath, description, albumID)
+	// Two-step upload: byte stream → batchCreate. From here the upload is in
+	// flight, so an interrupt (Ctrl+C) lets it finish rather than aborting it
+	// and recording a spurious failure. A second Ctrl+C exits the process.
+	mediaID, err := p.client.UploadMedia(context.WithoutCancel(ctx), job.MediaPath, description, albumID)
 	if err != nil {
 		log.Error("upload failed", zap.Error(err))
 		_ = p.store.SetMediaError(job.MediaPath, err.Error())

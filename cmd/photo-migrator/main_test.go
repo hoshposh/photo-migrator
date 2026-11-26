@@ -2,15 +2,28 @@ package main
 
 import (
 	"archive/zip"
+	"bytes"
+	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/spf13/viper"
+	"go.uber.org/zap"
 
+	"github.com/hoshposh/photo-migrator/internal/photos"
+	"github.com/hoshposh/photo-migrator/internal/pipeline"
 	"github.com/hoshposh/photo-migrator/internal/store"
 )
 
@@ -292,5 +305,227 @@ func TestLargeFiles_ExpandsTildeInDBPath(t *testing.T) {
 	}
 	if !strings.Contains(out, `"file": "big.mp4"`) {
 		t.Errorf("large-files did not report big.mp4 from ~/m.db; output:\n%s", out)
+	}
+}
+
+// runWithOutput runs the CLI like main does (cobra's own usage/error
+// printing left at defaults) with ctx as the command context, returning the
+// combined output cobra printed and the returned error.
+func runWithOutput(t *testing.T, ctx context.Context, args ...string) (string, error) {
+	t.Helper()
+	isolate(t)
+	viper.Reset()
+	configPath = ""
+
+	var buf bytes.Buffer
+	root := newRootCmd()
+	root.SetArgs(args)
+	root.SetOut(&buf)
+	root.SetErr(&buf)
+	err := root.ExecuteContext(ctx)
+	return buf.String(), err
+}
+
+// Break caught: an interrupted run being reported as a usage mistake.
+func TestInterruptedRun_PrintsNoUsage(t *testing.T) {
+	takeoutDir := t.TempDir()
+	writeTakeoutZip(t, takeoutDir, "takeout-001.zip")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	out, err := runWithOutput(t, ctx, "run",
+		"--takeout-dir", takeoutDir,
+		"--db-path", filepath.Join(t.TempDir(), "m.db"),
+		"--dry-run", "--restore-metadata=false",
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if strings.Contains(out, "Usage:") || strings.Contains(out, "Error:") {
+		t.Errorf("interrupt printed usage/error text:\n%s", out)
+	}
+}
+
+// Guard: genuine command-line mistakes must still show usage.
+func TestUnknownFlag_StillPrintsUsage(t *testing.T) {
+	out, err := runWithOutput(t, context.Background(), "run", "--no-such-flag")
+	if err == nil {
+		t.Fatal("expected an error for an unknown flag")
+	}
+	if !strings.Contains(out, "Usage:") {
+		t.Errorf("unknown flag did not print usage:\n%s", out)
+	}
+}
+
+// Break caught: wrong exit code or message for interrupts vs real errors.
+func TestExitCode(t *testing.T) {
+	cases := []struct {
+		name     string
+		err      error
+		wantCode int
+		wantOut  string
+	}{
+		{"success", nil, 0, ""},
+		{"interrupted", fmt.Errorf("walk directory: %w", context.Canceled), 130, "Interrupted"},
+		{"failure", errors.New("open database: boom"), 1, "Error: open database: boom"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			if got := exitCode(tc.err, &buf); got != tc.wantCode {
+				t.Errorf("exitCode = %d, want %d", got, tc.wantCode)
+			}
+			if !strings.Contains(buf.String(), tc.wantOut) {
+				t.Errorf("output %q does not contain %q", buf.String(), tc.wantOut)
+			}
+			if tc.err == nil && buf.Len() != 0 {
+				t.Errorf("success printed %q", buf.String())
+			}
+		})
+	}
+}
+
+// rewriteTransport sends every request to target instead of Google.
+type rewriteTransport struct{ target *url.URL }
+
+func (rt rewriteTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	r = r.Clone(r.Context())
+	r.URL.Scheme, r.URL.Host = rt.target.Scheme, rt.target.Host
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+// Break caught: Ctrl+C aborting an upload already in progress and recording
+// it (and its zip) as failed, or starting new uploads after the interrupt.
+func TestProcessZips_InterruptFinishesInFlightUpload(t *testing.T) {
+	started := make(chan struct{}, 10)
+	release := make(chan struct{})
+	var uploads atomic.Int32
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/uploads"):
+			uploads.Add(1)
+			started <- struct{}{}
+			<-release
+			_, _ = io.WriteString(w, "upload-token")
+		case strings.HasSuffix(r.URL.Path, "/mediaItems:batchCreate"):
+			_, _ = io.WriteString(w, `{"newMediaItemResults":[{"uploadToken":"upload-token","status":{},"mediaItem":{"id":"media-1"}}]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer fake.Close()
+	target, _ := url.Parse(fake.URL)
+	client := photos.New(&http.Client{Transport: rewriteTransport{target}})
+
+	zipPath := filepath.Join(t.TempDir(), "takeout-001.zip")
+	f, err := os.Create(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(f)
+	for _, n := range []string{"a.jpg", "b.jpg", "c.jpg"} {
+		w, _ := zw.Create("Takeout/Google Photos/Photos from 2020/" + n)
+		_, _ = w.Write([]byte(n))
+	}
+	_ = zw.Close()
+	_ = f.Close()
+
+	dbPath := filepath.Join(t.TempDir(), "m.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	if err := st.RegisterZip(zipPath); err != nil {
+		t.Fatal(err)
+	}
+
+	logger := zap.NewNop()
+	pool := pipeline.NewPool(pipeline.Config{Workers: 1, RateLimit: 1000, Logger: logger}, client, st)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- processZips(ctx, []string{zipPath}, t.TempDir(), st, pool, logger) }()
+
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("upload never started")
+	}
+	cancel()       // Ctrl+C while the first upload is in flight
+	close(release) // ...then let that upload finish
+
+	var runErr error
+	select {
+	case runErr = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("processZips did not return after interrupt")
+	}
+	if !errors.Is(runErr, context.Canceled) {
+		t.Errorf("processZips error = %v, want context.Canceled", runErr)
+	}
+	if n := uploads.Load(); n != 1 {
+		t.Errorf("uploads started = %d, want 1 (no new uploads after interrupt)", n)
+	}
+
+	stats, err := st.GetStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.CompleteMedia != 1 {
+		t.Errorf("complete media = %d, want 1 (in-flight upload should finish)", stats.CompleteMedia)
+	}
+	if stats.ErrorMedia != 0 {
+		t.Errorf("error media = %d, want 0 (interrupt is not a failure)", stats.ErrorMedia)
+	}
+	var zipStatus string
+	var zipErr sql.NullString
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if err := db.QueryRow(`SELECT status, error_msg FROM zip_archives`).Scan(&zipStatus, &zipErr); err != nil {
+		t.Fatal(err)
+	}
+	if zipStatus != "pending" || zipErr.String != "" {
+		t.Errorf("zip after interrupt = (%q, %q), want (\"pending\", \"\")", zipStatus, zipErr.String)
+	}
+}
+
+// Break caught: a second Ctrl+C being swallowed, leaving no way to quit.
+func TestWithSignals_SecondSignalQuitsImmediately(t *testing.T) {
+	exited := make(chan int, 1)
+	origExit := exitFunc
+	exitFunc = func(code int) { exited <- code }
+	defer func() { exitFunc = origExit }()
+
+	ctx, stop := withSignals(context.Background())
+	defer stop()
+
+	if err := syscall.Kill(os.Getpid(), syscall.SIGINT); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("first SIGINT did not cancel the context")
+	}
+	select {
+	case code := <-exited:
+		t.Fatalf("first SIGINT exited immediately with %d; it should stop gracefully", code)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	if err := syscall.Kill(os.Getpid(), syscall.SIGINT); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case code := <-exited:
+		if code != 130 {
+			t.Errorf("exit code = %d, want 130", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("second SIGINT did not quit")
 	}
 }

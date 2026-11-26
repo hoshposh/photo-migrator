@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -27,8 +30,22 @@ import (
 var configPath string
 
 func main() {
-	if err := newRootCmd().Execute(); err != nil {
-		os.Exit(1)
+	os.Exit(exitCode(newRootCmd().Execute(), os.Stderr))
+}
+
+// exitCode reports the result of a command on w and maps it to a process
+// exit code: 0 success, 130 interrupted (the shell convention for Ctrl+C),
+// 1 any other error.
+func exitCode(err error, w io.Writer) int {
+	switch {
+	case err == nil:
+		return 0
+	case errors.Is(err, context.Canceled):
+		_, _ = fmt.Fprintln(w, "Interrupted. Progress is saved; run the same command again to resume.")
+		return 130
+	default:
+		_, _ = fmt.Fprintln(w, "Error:", err)
+		return 1
 	}
 }
 
@@ -59,8 +76,14 @@ Quick start:
   photo-migrator status`,
 		// initConfig runs before every subcommand so viper is ready.
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			// Flags parsed fine, so any error from here on is a runtime
+			// failure or an interrupt, not a usage mistake: don't print usage.
+			cmd.SilenceUsage = true
 			return initConfig(cmd)
 		},
+		// main prints errors itself (see exitCode), once, with the right
+		// wording for interrupts.
+		SilenceErrors: true,
 	}
 
 	// --config overrides the config file location.
@@ -311,8 +334,11 @@ func newRunCmd() *cobra.Command {
     Walk the directory and upload all media directly.
 
 Runs are fully idempotent: files already marked complete in the database
-are skipped. Ctrl-C triggers a graceful shutdown — in-flight uploads finish
-before the process exits.`,
+are skipped.
+
+Stopping: press Ctrl-C once to stop gracefully — no new uploads start, uploads
+already in progress finish, and the current zip resumes on the next run.
+Press Ctrl-C again to quit immediately.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			logger := buildLogger()
 
@@ -350,7 +376,8 @@ before the process exits.`,
 				viper.GetFloat64("rate-limit"),
 				dryRun, restoreMetadata, logger, photosClient, st,
 			)
-			ctx := withSignals(cmd.Context())
+			ctx, stopSignals := withSignals(cmd.Context())
+			defer stopSignals()
 
 			zipMode, err := takeout.IsZipMode(takeoutDir)
 			if err != nil {
@@ -865,8 +892,11 @@ func processZips(ctx context.Context, zips []string, stagingDir string, st *stor
 		if err := setZipStatus(zipPath, store.StatusExtracting, ""); err != nil {
 			return err
 		}
-		extractRoot, err := takeout.ExtractZip(zipPath, stagingDir, logger)
+		extractRoot, err := takeout.ExtractZip(ctx, zipPath, stagingDir, logger)
 		if err != nil {
+			if ctx.Err() != nil {
+				return interrupted(ctx, zipPath, setZipStatus, logger)
+			}
 			logger.Error("extraction failed", zap.String("zip", zipPath), zap.Error(err))
 			_ = setZipStatus(zipPath, store.StatusError, err.Error())
 			continue // try next zip
@@ -876,15 +906,20 @@ func processZips(ctx context.Context, zips []string, stagingDir string, st *stor
 			return err
 		}
 
-		if err := processDirectory(ctx, extractRoot, zipPath, st, pool, logger); err != nil {
-			logger.Error("upload phase failed", zap.String("zip", zipPath), zap.Error(err))
-			_ = setZipStatus(zipPath, store.StatusError, err.Error())
-		}
+		uploadErr := processDirectory(ctx, extractRoot, zipPath, st, pool, logger)
 
 		// Remove staging files regardless of success/error — completed items
 		// are tracked in the DB; failures will be re-extracted on the next run.
 		if err := os.RemoveAll(extractRoot); err != nil {
 			logger.Warn("cleanup staging", zap.String("dir", extractRoot), zap.Error(err))
+		}
+
+		if ctx.Err() != nil {
+			return interrupted(ctx, zipPath, setZipStatus, logger)
+		}
+		if uploadErr != nil {
+			logger.Error("upload phase failed", zap.String("zip", zipPath), zap.Error(uploadErr))
+			_ = setZipStatus(zipPath, store.StatusError, uploadErr.Error())
 		}
 
 		if pool.DryRun() {
@@ -910,6 +945,15 @@ func processZips(ctx context.Context, zips []string, stagingDir string, st *stor
 	return nil
 }
 
+// interrupted handles a Ctrl+C during a zip: the zip goes back to pending
+// with no error (it resumes on the next run; finished uploads are skipped)
+// and ctx.Err() is returned so the command exits as interrupted.
+func interrupted(ctx context.Context, zipPath string, setZipStatus func(string, store.Status, string) error, logger *zap.Logger) error {
+	_ = setZipStatus(zipPath, store.StatusPending, "")
+	logger.Info("interrupted — zip will resume on the next run", zap.String("zip", zipPath))
+	return ctx.Err()
+}
+
 // processDirectory walks a directory, registers and uploads all media files.
 func processDirectory(ctx context.Context, dir, sourceZip string, st *store.Store, pool *pipeline.Pool, logger *zap.Logger) error {
 	jobs := make(chan pipeline.Job, 200)
@@ -917,7 +961,7 @@ func processDirectory(ctx context.Context, dir, sourceZip string, st *store.Stor
 
 	go func() {
 		defer close(jobs)
-		err := takeout.WalkDirectory(dir, sourceZip, st.IsUploaded, func(j takeout.MigrationJob) {
+		err := takeout.WalkDirectory(ctx, dir, sourceZip, st.IsUploaded, func(j takeout.MigrationJob) {
 			// Register in DB before handing off to the worker pool. Skipped on
 			// dry runs: rows are keyed by (staging) path, and rows a real run
 			// never revisits would keep their zip incomplete forever.
@@ -978,7 +1022,7 @@ func uploadFromDB(ctx context.Context, st *store.Store, pool *pipeline.Pool, log
 	}()
 
 	pool.Run(ctx, jobs)
-	return nil
+	return ctx.Err() // non-nil only if interrupted
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1078,16 +1122,35 @@ func viperPath(key string) string {
 	return expandPath(viper.GetString(key))
 }
 
-// withSignals returns a context that is cancelled on SIGINT or SIGTERM,
-// allowing in-flight uploads to complete before exit.
-func withSignals(ctx context.Context) context.Context {
+// withSignals returns a context that is cancelled on the first SIGINT or
+// SIGTERM, so no new work starts while uploads already in progress finish.
+// A second signal exits the process immediately with code 130. Call the
+// returned stop function to release the signal handler.
+func withSignals(ctx context.Context) (context.Context, func()) {
 	ctx, cancel := context.WithCancel(ctx)
-	sigs := make(chan os.Signal, 1)
+	sigs := make(chan os.Signal, 2)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
-		<-sigs
-		fmt.Fprintln(os.Stderr, "\nShutting down gracefully (waiting for in-flight uploads)...")
+		if _, ok := <-sigs; !ok {
+			return
+		}
+		fmt.Fprintln(os.Stderr, "\nStopping: finishing uploads already in progress. Press Ctrl+C again to quit immediately.")
 		cancel()
+		if _, ok := <-sigs; !ok {
+			return
+		}
+		fmt.Fprintln(os.Stderr, "\nQuitting immediately. Unfinished uploads will be retried on the next run.")
+		exitFunc(130)
 	}()
-	return ctx
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			signal.Stop(sigs)
+			close(sigs)
+		})
+	}
+	return ctx, stop
 }
+
+// exitFunc exits the process; a variable so tests can intercept it.
+var exitFunc = os.Exit

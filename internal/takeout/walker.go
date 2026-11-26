@@ -2,6 +2,7 @@ package takeout
 
 import (
 	"archive/zip"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -64,8 +65,9 @@ func ListZips(dir string) ([]string, error) {
 
 // ExtractZip extracts zipPath into <stagingDir>/<zip-stem>/ and returns the
 // extraction root. It guards against zip-slip attacks and creates all needed
-// parent directories.
-func ExtractZip(zipPath, stagingDir string, logger *zap.Logger) (string, error) {
+// parent directories. If ctx is cancelled it stops, removes the partial
+// extraction, and returns ctx.Err().
+func ExtractZip(ctx context.Context, zipPath, stagingDir string, logger *zap.Logger) (string, error) {
 	stem := strings.TrimSuffix(filepath.Base(zipPath), filepath.Ext(zipPath))
 	destRoot := filepath.Join(stagingDir, stem)
 
@@ -82,6 +84,12 @@ func ExtractZip(zipPath, stagingDir string, logger *zap.Logger) (string, error) 
 	cleanRoot := filepath.Clean(destRoot) + string(os.PathSeparator)
 
 	for _, f := range r.File {
+		// Stop promptly on interrupt; a partial extraction is useless, so
+		// remove it (the zip is simply re-extracted on the next run).
+		if err := ctx.Err(); err != nil {
+			_ = os.RemoveAll(destRoot)
+			return "", err
+		}
 		fpath := filepath.Join(destRoot, filepath.FromSlash(f.Name))
 
 		// Zip-slip guard: ensure extraction target is inside destRoot.
@@ -101,7 +109,11 @@ func ExtractZip(zipPath, stagingDir string, logger *zap.Logger) (string, error) 
 			return "", err
 		}
 
-		if err := extractFile(f, fpath); err != nil {
+		if err := extractFile(ctx, f, fpath); err != nil {
+			if ctx.Err() != nil {
+				_ = os.RemoveAll(destRoot)
+				return "", ctx.Err()
+			}
 			return "", fmt.Errorf("extract %s: %w", f.Name, err)
 		}
 	}
@@ -110,7 +122,7 @@ func ExtractZip(zipPath, stagingDir string, logger *zap.Logger) (string, error) 
 	return destRoot, nil
 }
 
-func extractFile(f *zip.File, destPath string) (err error) {
+func extractFile(ctx context.Context, f *zip.File, destPath string) (err error) {
 	out, err := os.OpenFile(destPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
 	if err != nil {
 		return err
@@ -131,12 +143,27 @@ func extractFile(f *zip.File, destPath string) (err error) {
 		}
 	}()
 
-	_, err = io.Copy(out, rc)
+	_, err = io.Copy(out, &ctxReader{ctx: ctx, r: rc})
 	return err
 }
 
+// ctxReader stops a copy part-way when ctx is cancelled, so an interrupt does
+// not have to wait for a multi-GB file to finish extracting.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c *ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
+}
+
 // WalkDirectory walks an extracted Takeout directory and calls emit for each
-// media file that has not already been uploaded.
+// media file that has not already been uploaded. It stops and returns
+// ctx.Err() as soon as ctx is cancelled.
 //
 // isUploaded is called for every media file found; if it returns true the file
 // is silently skipped (idempotency).
@@ -145,12 +172,16 @@ func extractFile(f *zip.File, destPath string) (err error) {
 // uses a closure that registers the item in the store and forwards it to a
 // pipeline channel.
 func WalkDirectory(
+	ctx context.Context,
 	dir, sourceZip string,
 	isUploaded func(string) (bool, error),
 	emit func(MigrationJob),
 	logger *zap.Logger,
 ) error {
 	return filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr // interrupted: stop walking
+		}
 		if err != nil {
 			logger.Warn("walk error", zap.String("path", path), zap.Error(err))
 			return nil // log and continue
@@ -257,7 +288,7 @@ func ExtractFiles(zipPath, destDir string, wantNames map[string]struct{}, logger
 		if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
 			return fmt.Errorf("mkdir for %s: %w", destPath, err)
 		}
-		if err := extractFile(f, destPath); err != nil {
+		if err := extractFile(context.Background(), f, destPath); err != nil {
 			return fmt.Errorf("extract %s: %w", f.Name, err)
 		}
 		logger.Info("extracted", zap.String("entry", entryName), zap.String("dest", destPath))

@@ -299,9 +299,11 @@ You can then open [photos.google.com](https://photos.google.com/), click
 
 ---
 
-## Resuming an interrupted run
+## Stopping and resuming
 
-Just re-run the same `run` command. The database tracks every file's state, so:
+Press **Ctrl+C** once to stop gracefully: no new uploads start, uploads already in progress are allowed to finish, and the tool exits with code 130. Press **Ctrl+C** a second time to quit immediately; any upload cut off that way is simply retried on the next run.
+
+To resume, just re-run the same `run` command. The database tracks every file's state, so:
 - Completed files are skipped instantly.
 - Files that errored are retried.
 - Zips that were partially extracted are re-extracted (already-uploaded files within them are skipped).
