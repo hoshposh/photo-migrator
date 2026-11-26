@@ -5,8 +5,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -46,15 +49,66 @@ type Pool struct {
 	client     *photos.Client
 	store      *store.Store
 	albumGroup singleflight.Group // deduplicates concurrent album creation
+
+	inflightMu sync.Mutex
+	inflight   map[*inflightUpload]struct{} // byte uploads in progress
 }
 
 // NewPool creates a Pool with the given configuration.
 func NewPool(cfg Config, client *photos.Client, st *store.Store) *Pool {
 	return &Pool{
-		cfg:    cfg,
-		client: client,
-		store:  st,
+		cfg:      cfg,
+		client:   client,
+		store:    st,
+		inflight: map[*inflightUpload]struct{}{},
 	}
+}
+
+// Upload describes a byte upload in progress.
+type Upload struct {
+	File       string // file name
+	Sent, Size int64  // bytes sent so far, and the file's size
+}
+
+// inflightUpload tracks one upload for InFlight.
+type inflightUpload struct {
+	file string
+	size int64
+	sent atomic.Int64
+}
+
+// track registers an upload as in progress; call the returned func when the
+// upload has finished (successfully or not).
+func (p *Pool) track(file string, size int64) (*inflightUpload, func()) {
+	u := &inflightUpload{file: file, size: size}
+	p.inflightMu.Lock()
+	p.inflight[u] = struct{}{}
+	p.inflightMu.Unlock()
+	return u, func() {
+		p.inflightMu.Lock()
+		delete(p.inflight, u)
+		p.inflightMu.Unlock()
+	}
+}
+
+// InFlight returns the byte uploads in progress, the most data still to
+// send first. It is safe to call at any time, e.g. after Ctrl+C to show what
+// the run is waiting for.
+func (p *Pool) InFlight() []Upload {
+	p.inflightMu.Lock()
+	out := make([]Upload, 0, len(p.inflight))
+	for u := range p.inflight {
+		out = append(out, Upload{File: u.file, Sent: u.sent.Load(), Size: u.size})
+	}
+	p.inflightMu.Unlock()
+	sort.Slice(out, func(i, j int) bool {
+		ri, rj := out[i].Size-out[i].Sent, out[j].Size-out[j].Sent
+		if ri != rj {
+			return ri > rj
+		}
+		return out[i].File < out[j].File
+	})
+	return out
 }
 
 // DryRun reports whether the pool only logs planned uploads.
@@ -174,7 +228,14 @@ func (p *Pool) process(ctx context.Context, job Job, stop func(error), b *batche
 	// Step 1 of 2: upload the bytes. From here the upload is in flight, so an
 	// interrupt (Ctrl+C) lets it finish rather than aborting it and recording
 	// a spurious failure. A second Ctrl+C exits the process.
-	token, err := p.client.UploadBytes(photos.WithLogger(context.WithoutCancel(ctx), log), job.MediaPath, job.MimeType)
+	var size int64
+	if fi, err := os.Stat(job.MediaPath); err == nil {
+		size = fi.Size()
+	}
+	progress, done := p.track(filepath.Base(job.MediaPath), size)
+	uploadCtx := photos.WithProgress(photos.WithLogger(context.WithoutCancel(ctx), log), &progress.sent)
+	token, err := p.client.UploadBytes(uploadCtx, job.MediaPath, job.MimeType)
+	done()
 	if err != nil {
 		err = fmt.Errorf("byte upload: %w", err)
 		if errors.Is(err, photos.ErrAuthFailed) {

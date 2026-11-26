@@ -214,3 +214,32 @@ func TestWritesNeverOverlap(t *testing.T) {
 		t.Errorf("up to %d write calls (createAlbum/batchCreate) ran at once, want 1", n)
 	}
 }
+
+// Break caught: no way to tell how far a large upload has got (needed to
+// show what Ctrl+C is waiting for), or a retry double-counting bytes.
+func TestUploadBytesReportsProgress(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable) // first attempt fails after sending everything
+			return
+		}
+		_, _ = io.WriteString(w, "tok")
+	}))
+	defer srv.Close()
+	c := New(srv.Client())
+	c.baseURL = srv.URL + "/v1"
+
+	p := filepath.Join(t.TempDir(), "clip.mp4")
+	if err := os.WriteFile(p, make([]byte, 300_000), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var sent atomic.Int64
+	if _, err := c.UploadBytes(WithProgress(context.Background(), &sent), p, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := sent.Load(); got != 300_000 {
+		t.Errorf("progress = %d bytes, want 300000 (reset on retry, not doubled)", got)
+	}
+}

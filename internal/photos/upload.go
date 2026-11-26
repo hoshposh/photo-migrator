@@ -12,7 +12,35 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 )
+
+type progressKey struct{}
+
+// WithProgress returns a context in which UploadBytes keeps sent up to date
+// with the number of bytes sent so far (reset to 0 when a retry starts over).
+func WithProgress(ctx context.Context, sent *atomic.Int64) context.Context {
+	return context.WithValue(ctx, progressKey{}, sent)
+}
+
+func progressFrom(ctx context.Context) *atomic.Int64 {
+	sent, _ := ctx.Value(progressKey{}).(*atomic.Int64)
+	return sent
+}
+
+// countingReader adds every byte read to n.
+type countingReader struct {
+	r io.ReadCloser
+	n *atomic.Int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n.Add(int64(n))
+	return n, err
+}
+
+func (c *countingReader) Close() error { return c.r.Close() }
 
 // ErrTooLarge reports that Google rejected a file as too large for the API
 // (HTTP 413). Retrying cannot help; the file must be uploaded manually.
@@ -41,7 +69,13 @@ func (c *Client) UploadBytes(ctx context.Context, mediaPath, mime string) (_ str
 		return "", err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/uploads", io.NopCloser(f))
+	sent := progressFrom(ctx)
+	reqBody := io.NopCloser(f)
+	if sent != nil {
+		sent.Store(0)
+		reqBody = &countingReader{r: reqBody, n: sent}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/uploads", reqBody)
 	if err != nil {
 		return "", err
 	}
@@ -52,7 +86,12 @@ func (c *Client) UploadBytes(ctx context.Context, mediaPath, mime string) (_ str
 
 	// GetBody lets doWithRetry re-open the file on a retry.
 	req.GetBody = func() (io.ReadCloser, error) {
-		return os.Open(mediaPath)
+		g, err := os.Open(mediaPath)
+		if err != nil || sent == nil {
+			return g, err
+		}
+		sent.Store(0) // the retry sends the file from the start
+		return &countingReader{r: g, n: sent}, nil
 	}
 
 	resp, err := c.doWithRetry(ctx, req)

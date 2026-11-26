@@ -339,7 +339,14 @@ Add the extracted files to the destination account (for example from your phone)
 
 ## Stopping and resuming
 
-Press **Ctrl+C** once to stop gracefully: no new uploads start, uploads already in progress are allowed to finish, and the tool exits with code 130. Press **Ctrl+C** a second time to quit immediately; any upload cut off that way is simply retried on the next run.
+Press **Ctrl+C** once to stop gracefully: no new uploads start, uploads already in progress are allowed to finish, and the tool exits with code 130. While it waits, it lists the uploads still in progress and how far each has got, every 10 seconds, so you can see whether a large video is worth waiting for:
+
+```
+Stopping: waiting for 2 upload(s) in progress. Ctrl+C again quits now (they restart from zero on the next run).
+  Arrival (2016).mp4   312 / 456 MB
+  IMG_1.jpg            2.0 / 2.4 MB
+```
+ Press **Ctrl+C** a second time to quit immediately; any upload cut off that way is simply retried on the next run.
 
 To resume, just re-run the same `run` command. The database tracks every file's state, so:
 - Completed files are skipped instantly.

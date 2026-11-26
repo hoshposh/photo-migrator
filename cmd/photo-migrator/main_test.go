@@ -504,7 +504,8 @@ func TestWithSignals_SecondSignalQuitsImmediately(t *testing.T) {
 	exitFunc = func(code int) { exited <- code }
 	defer func() { exitFunc = origExit }()
 
-	ctx, stop := withSignals(context.Background())
+	var stopped atomic.Int32
+	ctx, stop := withSignals(context.Background(), func() { stopped.Add(1) })
 	defer stop()
 
 	if err := syscall.Kill(os.Getpid(), syscall.SIGINT); err != nil {
@@ -519,6 +520,9 @@ func TestWithSignals_SecondSignalQuitsImmediately(t *testing.T) {
 	case code := <-exited:
 		t.Fatalf("first SIGINT exited immediately with %d; it should stop gracefully", code)
 	case <-time.After(100 * time.Millisecond):
+	}
+	if n := stopped.Load(); n != 1 {
+		t.Errorf("onStop called %d times after the first SIGINT, want 1", n)
 	}
 
 	if err := syscall.Kill(os.Getpid(), syscall.SIGINT); err != nil {
@@ -1465,5 +1469,81 @@ func TestProcessZips_BatchItemFailureFailsOnlyThatFile(t *testing.T) {
 		if got[n][0] != "complete" {
 			t.Errorf("%s = %v, want complete", n, got[n])
 		}
+	}
+}
+
+// Break caught: Ctrl+C waiting minutes for large uploads with no way to see
+// which files it is waiting for or how far they have got.
+func TestPoolInFlightListsUploadsInProgress(t *testing.T) {
+	received := make(chan struct{})
+	release := make(chan struct{})
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/uploads"):
+			_, _ = io.Copy(io.Discard, r.Body)
+			close(received)
+			<-release
+			_, _ = io.WriteString(w, nextToken())
+		case strings.HasSuffix(r.URL.Path, "/mediaItems:batchCreate"):
+			echoBatchCreate(w, r, nil)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer fake.Close()
+	target, _ := url.Parse(fake.URL)
+	client := photos.New(&http.Client{Transport: rewriteTransport{target}})
+
+	zipPath := filepath.Join(t.TempDir(), "takeout-001.zip")
+	writeZipEntries(t, zipPath, map[string]string{
+		"Takeout/Google Photos/Photos from 2016/Arrival (2016).mp4": strings.Repeat("v", 5000),
+	})
+	st, err := store.Open(filepath.Join(t.TempDir(), "m.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	if err := st.RegisterZip(zipPath); err != nil {
+		t.Fatal(err)
+	}
+	logger := zap.NewNop()
+	pool := pipeline.NewPool(pipeline.Config{Workers: 1, Logger: logger}, client, st)
+	done := make(chan error, 1)
+	go func() { done <- processZips(context.Background(), []string{zipPath}, t.TempDir(), st, pool, logger) }()
+
+	select {
+	case <-received:
+	case <-time.After(10 * time.Second):
+		t.Fatal("upload never reached the server")
+	}
+	got := pool.InFlight()
+	want := []pipeline.Upload{{File: "Arrival (2016).mp4", Sent: 5000, Size: 5000}}
+	if len(got) != 1 || got[0] != want[0] {
+		t.Errorf("InFlight() = %+v, want %+v", got, want)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if left := pool.InFlight(); len(left) != 0 {
+		t.Errorf("InFlight() after the run = %+v, want none", left)
+	}
+}
+
+// Break caught: an unreadable or misleading stop report.
+func TestStopReport(t *testing.T) {
+	const mb = 1 << 20
+	got := stopReport([]pipeline.Upload{
+		{File: "IMG_1.jpg", Sent: 2 * mb, Size: 2*mb + 2*mb/5}, // 2.4 MB
+		{File: "Arrival (2016).mp4", Sent: 312 * mb, Size: 456 * mb},
+	})
+	want := "Stopping: waiting for 2 upload(s) in progress. Ctrl+C again quits now (they restart from zero on the next run).\n" +
+		"  Arrival (2016).mp4   312 / 456 MB\n" +
+		"  IMG_1.jpg            2.0 / 2.4 MB\n"
+	if got != want {
+		t.Errorf("stopReport =\n%s\nwant\n%s", got, want)
+	}
+	if got := stopReport(nil); !strings.Contains(got, "no uploads in progress") {
+		t.Errorf("stopReport(nil) = %q, want it to say no uploads are in progress", got)
 	}
 }

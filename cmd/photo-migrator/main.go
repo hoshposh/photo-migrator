@@ -9,9 +9,11 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -494,7 +496,7 @@ Press Ctrl-C again to quit immediately.`,
 				viper.GetInt("workers"),
 				dryRun, restoreMetadata, logger, photosClient, st,
 			)
-			ctx, stopSignals := withSignals(cmd.Context())
+			ctx, stopSignals := withSignals(cmd.Context(), func() { go reportStopping(pool) })
 			defer stopSignals()
 
 			zipMode, err := takeout.IsZipMode(takeoutDir)
@@ -1438,10 +1440,11 @@ func viperPath(key string) string {
 }
 
 // withSignals returns a context that is cancelled on the first SIGINT or
-// SIGTERM, so no new work starts while uploads already in progress finish.
+// SIGTERM, so no new work starts while uploads already in progress finish;
+// onStop (if not nil) is then called to report progress and must not block.
 // A second signal exits the process immediately with code 130. Call the
 // returned stop function to release the signal handler.
-func withSignals(ctx context.Context) (context.Context, func()) {
+func withSignals(ctx context.Context, onStop func()) (context.Context, func()) {
 	ctx, cancel := context.WithCancel(ctx)
 	sigs := make(chan os.Signal, 2)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
@@ -1449,8 +1452,12 @@ func withSignals(ctx context.Context) (context.Context, func()) {
 		if _, ok := <-sigs; !ok {
 			return
 		}
-		fmt.Fprintln(os.Stderr, "\nStopping: finishing uploads already in progress. Press Ctrl+C again to quit immediately.")
 		cancel()
+		if onStop != nil {
+			onStop()
+		} else {
+			fmt.Fprintln(os.Stderr, "\nStopping: finishing uploads already in progress. Press Ctrl+C again to quit immediately.")
+		}
 		if _, ok := <-sigs; !ok {
 			return
 		}
@@ -1465,6 +1472,57 @@ func withSignals(ctx context.Context) (context.Context, func()) {
 		})
 	}
 	return ctx, stop
+}
+
+// stopReport describes what an interrupted run is still waiting for.
+func stopReport(ups []pipeline.Upload) string {
+	if len(ups) == 0 {
+		return "Stopping: no uploads in progress; adding files already uploaded to the library. Ctrl+C again quits now.\n"
+	}
+	// Most data still to send first: the uploads the stop is waiting on.
+	ups = append([]pipeline.Upload(nil), ups...)
+	sort.SliceStable(ups, func(i, j int) bool { return ups[i].Size-ups[i].Sent > ups[j].Size-ups[j].Sent })
+	const maxName = 40
+	width := 0
+	names := make([]string, len(ups))
+	for i, u := range ups {
+		n := u.File
+		if r := []rune(n); len(r) > maxName {
+			n = string(r[:maxName-1]) + "…"
+		}
+		names[i] = n
+		if l := len([]rune(n)); l > width {
+			width = l
+		}
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "Stopping: waiting for %d upload(s) in progress. Ctrl+C again quits now (they restart from zero on the next run).\n", len(ups))
+	for i, u := range ups {
+		fmt.Fprintf(&b, "  %-*s   %s\n", width, names[i], progressMB(u.Sent, u.Size))
+	}
+	return b.String()
+}
+
+// progressMB formats "sent / size MB", with one decimal for small files.
+func progressMB(sent, size int64) string {
+	const mb = 1 << 20
+	if size < 10*mb {
+		return fmt.Sprintf("%.1f / %.1f MB", float64(sent)/mb, float64(size)/mb)
+	}
+	return fmt.Sprintf("%.0f / %.0f MB", float64(sent)/mb, float64(size)/mb)
+}
+
+// reportStopping prints what the run is waiting for after Ctrl+C, and again
+// every 10 seconds while uploads are still in progress.
+func reportStopping(pool *pipeline.Pool) {
+	for {
+		ups := pool.InFlight()
+		fmt.Fprint(os.Stderr, "\n"+stopReport(ups))
+		if len(ups) == 0 {
+			return
+		}
+		time.Sleep(10 * time.Second)
+	}
 }
 
 // exitFunc exits the process; a variable so tests can intercept it.
