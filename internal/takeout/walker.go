@@ -17,6 +17,11 @@ import (
 // yearFolderRe matches Google Takeout year-based folders, e.g. "Photos from 2016".
 var yearFolderRe = regexp.MustCompile(`^Photos from \d{4}$`)
 
+// printOrderRe matches Takeout's folders for Google Photos print orders
+// ("Print Order 405124314898443163936"), which hold the ordered photos and a
+// print-order.pdf receipt. They are not albums.
+var printOrderRe = regexp.MustCompile(`^Print Order \d+$`)
+
 // motionPartRe matches the names Takeout gives the video half of a motion
 // photo: PXL_x.MP, PXL_x.MP~2, PXL_x.RAW-01.MP.COVER (the still is the same
 // name plus ".jpg", possibly in another zip).
@@ -472,13 +477,14 @@ func WalkDirectory(
 //   - Files directly in the root (no subdirectory)  → library root (empty).
 //   - Year folders ("Photos from YYYY")              → library root (empty).
 //   - "Archive", "Failed Videos", "Locked Folder"     → library root (empty).
+//   - Print orders ("Print Order <number>")           → library root (empty).
 //   - Any other named top-level folder               → album name = folder name.
 func albumFromPath(mediaPath, extractRoot string) string {
 	top := topFolder(mediaPath, extractRoot)
 	if top == "" {
 		return "" // file directly in the root — no album
 	}
-	if yearFolderRe.MatchString(top) || nonAlbumFolders[top] {
+	if yearFolderRe.MatchString(top) || printOrderRe.MatchString(top) || nonAlbumFolders[top] {
 		return "" // year or special folder → library root
 	}
 	return top

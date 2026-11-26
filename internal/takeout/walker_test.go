@@ -291,3 +291,18 @@ func TestWalkDirectory_ReportsSkipped(t *testing.T) {
 		t.Errorf("metadata skipped = %d, want 1", got)
 	}
 }
+
+// Break caught: each Google Photos print order ("Print Order <number>",
+// holding the ordered photos and a print-order.pdf receipt) becoming an
+// album with a meaningless numeric name.
+func TestAlbumFromPath_PrintOrderFolders(t *testing.T) {
+	root := filepath.Join("/staging", "takeout-001")
+	for rel, want := range map[string]string{
+		"Takeout/Google Photos/Print Order 405124314898443163936/IMG_1.jpg": "",
+		"Takeout/Google Photos/Print Order Ideas/IMG_2.jpg":                 "Print Order Ideas", // a real album name
+	} {
+		if got := albumFromPath(filepath.Join(root, filepath.FromSlash(rel)), root); got != want {
+			t.Errorf("albumFromPath(%q) = %q, want %q", rel, got, want)
+		}
+	}
+}
