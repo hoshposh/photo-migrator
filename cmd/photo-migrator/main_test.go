@@ -784,3 +784,194 @@ func TestBuildLogger_DoesNotDropRepeatedLines(t *testing.T) {
 		t.Errorf("logged %d of 250 lines; repeated messages are being sampled away", n)
 	}
 }
+
+// writeZipEntries creates a zip at path with the given entry -> content.
+func writeZipEntries(t *testing.T, path string, entries map[string]string) {
+	t.Helper()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(f)
+	for name, content := range entries {
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte(content))
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// lockedFixture is a fake Photos API plus a ledger holding one zip with a
+// Locked Folder file ("SECRET") and an ordinary photo.
+type lockedFixture struct {
+	secretUploads, albumsCreated atomic.Int32
+	st                           *store.Store
+	dbPath, zipPath, staging     string
+	pool                         *pipeline.Pool
+}
+
+func newLockedFixture(t *testing.T) *lockedFixture {
+	t.Helper()
+	fx := &lockedFixture{}
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/uploads"):
+			body, _ := io.ReadAll(r.Body)
+			if string(body) == "SECRET" {
+				fx.secretUploads.Add(1)
+			}
+			_, _ = io.WriteString(w, "upload-token")
+		case strings.HasSuffix(r.URL.Path, "/mediaItems:batchCreate"):
+			_, _ = io.WriteString(w, `{"newMediaItemResults":[{"uploadToken":"upload-token","status":{},"mediaItem":{"id":"media-1"}}]}`)
+		case strings.HasSuffix(r.URL.Path, "/albums"):
+			fx.albumsCreated.Add(1)
+			_, _ = io.WriteString(w, `{"id":"album-1","title":"x"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(fake.Close)
+	target, _ := url.Parse(fake.URL)
+	client := photos.New(&http.Client{Transport: rewriteTransport{target}})
+
+	fx.zipPath = filepath.Join(t.TempDir(), "takeout-001.zip")
+	writeZipEntries(t, fx.zipPath, map[string]string{
+		"Takeout/Google Photos/Locked Folder/secret.jpg": "SECRET",
+		"Takeout/Google Photos/Photos from 2020/a.jpg":   "ok",
+	})
+	fx.dbPath = filepath.Join(t.TempDir(), "m.db")
+	st, err := store.Open(fx.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if err := st.RegisterZip(fx.zipPath); err != nil {
+		t.Fatal(err)
+	}
+	fx.st = st
+	fx.staging = t.TempDir()
+	logger := zap.NewNop()
+	fx.pool = pipeline.NewPool(pipeline.Config{Workers: 2, RateLimit: 1000, Logger: logger}, client, st)
+	return fx
+}
+
+func (fx *lockedFixture) run(t *testing.T) {
+	t.Helper()
+	if err := processZips(context.Background(), []string{fx.zipPath}, fx.staging, fx.st, fx.pool, zap.NewNop()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (fx *lockedFixture) query(t *testing.T, q string) string {
+	t.Helper()
+	db, err := sql.Open("sqlite", fx.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	var v string
+	if err := db.QueryRow(q).Scan(&v); err != nil {
+		t.Fatalf("%s: %v", q, err)
+	}
+	return v
+}
+
+// Break caught: photos from Google Photos' private Locked Folder being
+// uploaded into the destination's main library (and an album named
+// "Locked Folder"), where they are visible on every device.
+func TestProcessZips_LockedFolderIsHeldBack(t *testing.T) {
+	fx := newLockedFixture(t)
+	fx.run(t)
+	fx.run(t)
+
+	if n := fx.secretUploads.Load(); n != 0 {
+		t.Errorf("Locked Folder file uploaded %d times, want 0", n)
+	}
+	if n := fx.albumsCreated.Load(); n != 0 {
+		t.Errorf("%d albums created, want 0 (no \"Locked Folder\" album)", n)
+	}
+	if got := fx.query(t, `SELECT status FROM media_items WHERE zip_entry LIKE '%secret.jpg'`); got != "locked" {
+		t.Errorf("secret.jpg status = %q, want \"locked\"", got)
+	}
+	if got := fx.query(t, `SELECT status FROM zip_archives`); got != "complete" {
+		t.Errorf("zip status = %q, want \"complete\" (held-back files don't block it)", got)
+	}
+	held, err := fx.st.GetLockedFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(held) != 1 || filepath.Base(held[0].SourcePath) != "secret.jpg" {
+		t.Errorf("GetLockedFiles = %+v, want just secret.jpg", held)
+	}
+}
+
+// Break caught: a held-back file that a review has approved (status reset to
+// pending, zip reopened) being held back again instead of uploaded.
+func TestProcessZips_ApprovedLockedFileIsUploaded(t *testing.T) {
+	fx := newLockedFixture(t)
+	fx.run(t)
+
+	db, err := sql.Open("sqlite", fx.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE media_items SET status = 'pending' WHERE zip_entry LIKE '%secret.jpg'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE zip_archives SET status = 'pending'`); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	fx.run(t)
+
+	if n := fx.secretUploads.Load(); n != 1 {
+		t.Errorf("approved file uploaded %d times, want 1", n)
+	}
+	if n := fx.albumsCreated.Load(); n != 0 {
+		t.Errorf("%d albums created, want 0 (approved files go to the library root)", n)
+	}
+	if got := fx.query(t, `SELECT status FROM media_items WHERE zip_entry LIKE '%secret.jpg'`); got != "complete" {
+		t.Errorf("secret.jpg status = %q, want \"complete\"", got)
+	}
+}
+
+// Break caught: `locked-files` not reporting held-back files, leaving the
+// user no way to find and handle them.
+func TestLockedFilesCommand_ListsHeldFiles(t *testing.T) {
+	home := isolate(t)
+	dbPath := filepath.Join(home, "m.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = st.Close()
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO media_items (source_path, source_zip, zip_entry, status)
+		VALUES ('/s/takeout-001/Takeout/Google Photos/Locked Folder/secret.jpg', '/t/takeout-001.zip',
+		        'Takeout/Google Photos/Locked Folder/secret.jpg', 'locked')`); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	var runErr error
+	out := captureStdout(t, func() {
+		runErr = runCLI(t, "locked-files", "--db-path", dbPath, "--format", "json")
+	})
+	if runErr != nil {
+		t.Fatalf("locked-files: %v", runErr)
+	}
+	if !strings.Contains(out, `"file": "secret.jpg"`) || !strings.Contains(out, `"in_zip_path": "Takeout/Google Photos/Locked Folder/secret.jpg"`) {
+		t.Errorf("locked-files output does not list secret.jpg:\n%s", out)
+	}
+}

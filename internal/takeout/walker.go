@@ -17,13 +17,20 @@ import (
 // yearFolderRe matches Google Takeout year-based folders, e.g. "Photos from 2016".
 var yearFolderRe = regexp.MustCompile(`^Photos from \d{4}$`)
 
+// LockedFolder is Takeout's folder for Google Photos' private, passcode-
+// protected Locked Folder. The API cannot put files there, so callers hold
+// these files back from upload (MigrationJob.Locked) unless approved.
+const LockedFolder = "Locked Folder"
+
 // nonAlbumFolders are special Takeout folders that are not albums: "Archive"
-// holds photos archived in Google Photos (a state the API cannot reproduce)
-// and "Failed Videos" holds videos Google could not process. Their files go
-// to the library root, like the year folders.
+// holds photos archived in Google Photos (a state the API cannot reproduce),
+// "Failed Videos" holds videos Google could not process, and the Locked
+// Folder is private. Their files go to the library root (if uploaded at all),
+// like the year folders.
 var nonAlbumFolders = map[string]bool{
 	"Archive":       true,
 	"Failed Videos": true,
+	LockedFolder:    true,
 }
 
 // MigrationJob is a single media file ready for upload.
@@ -43,6 +50,8 @@ type MigrationJob struct {
 	ZipEntry string
 	// Sidecar holds the parsed metadata (nil if not found).
 	Sidecar *Sidecar
+	// Locked reports that the file came from Google Photos' Locked Folder.
+	Locked bool
 }
 
 // IsZipMode returns true if dir contains at least one .zip file.
@@ -232,6 +241,7 @@ func WalkDirectory(
 			SourceZip:   sourceZip,
 			ZipEntry:    zipEntry,
 			Sidecar:     sidecar,
+			Locked:      topFolder(path, dir) == LockedFolder,
 		})
 		return nil
 	})
@@ -248,29 +258,35 @@ func WalkDirectory(
 // Classification rules (applied after prefix stripping):
 //   - Files directly in the root (no subdirectory)  → library root (empty).
 //   - Year folders ("Photos from YYYY")              → library root (empty).
-//   - "Archive" and "Failed Videos" (nonAlbumFolders) → library root (empty).
+//   - "Archive", "Failed Videos", "Locked Folder"     → library root (empty).
 //   - Any other named top-level folder               → album name = folder name.
 func albumFromPath(mediaPath, extractRoot string) string {
-	rel, err := filepath.Rel(extractRoot, mediaPath)
-	if err != nil {
-		return ""
-	}
-
-	// Strip the "Takeout/Google Photos/" wrapper that Google Takeout adds.
-	// filepath.Join normalises separators for the current OS.
-	googlePhotosPrefix := filepath.Join("Takeout", "Google Photos") + string(os.PathSeparator)
-	rel = strings.TrimPrefix(rel, googlePhotosPrefix)
-
-	// rel is now "<album>/<file>" or just "<file>" for root-level items.
-	parts := strings.SplitN(rel, string(os.PathSeparator), 2)
-	if len(parts) < 2 {
+	top := topFolder(mediaPath, extractRoot)
+	if top == "" {
 		return "" // file directly in the root — no album
 	}
-	top := parts[0]
 	if yearFolderRe.MatchString(top) || nonAlbumFolders[top] {
 		return "" // year or special folder → library root
 	}
 	return top
+}
+
+// topFolder returns the Takeout folder a media file sits in (the first path
+// component after the "Takeout/Google Photos/" wrapper), or "" for a file
+// directly in the root.
+func topFolder(mediaPath, extractRoot string) string {
+	rel, err := filepath.Rel(extractRoot, mediaPath)
+	if err != nil {
+		return ""
+	}
+	// Strip the "Takeout/Google Photos/" wrapper that Google Takeout adds.
+	// filepath.Join normalises separators for the current OS.
+	rel = strings.TrimPrefix(rel, filepath.Join("Takeout", "Google Photos")+string(os.PathSeparator))
+	parts := strings.SplitN(rel, string(os.PathSeparator), 2)
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[0]
 }
 
 // ExtractFiles extracts a specific set of in-zip entry names from zipPath into

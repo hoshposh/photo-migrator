@@ -32,6 +32,9 @@ const (
 	// StatusTooLarge marks a file Google rejected as too large for the API
 	// (HTTP 413). It is never retried; `large-files` lists it for manual upload.
 	StatusTooLarge Status = "too_large"
+	// StatusLocked marks a file from Google Photos' private Locked Folder,
+	// held back from upload. Setting it to pending (after review) releases it.
+	StatusLocked Status = "locked"
 )
 
 // Store wraps the SQLite database.
@@ -118,11 +121,12 @@ func (s *Store) SetZipStatus(zipPath string, status Status, errMsg string) error
 }
 
 // AllZipItemsComplete returns true when every media_item for the given zip is
-// done: complete, or too large for the API (reported by `large-files`).
+// done: complete, too large for the API (reported by `large-files`), or held
+// back from the Locked Folder (reported by `locked-files`).
 func (s *Store) AllZipItemsComplete(zipPath string) (bool, error) {
 	var pending int
 	err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM media_items WHERE source_zip = ? AND status NOT IN ('complete', 'too_large')`,
+		`SELECT COUNT(*) FROM media_items WHERE source_zip = ? AND status NOT IN ('complete', 'too_large', 'locked')`,
 		zipPath,
 	).Scan(&pending)
 	return pending == 0, err
@@ -168,8 +172,38 @@ func (s *Store) RegisterMedia(sourcePath, sourceZip, zipEntry, albumName string)
 	return err
 }
 
+// RegisterLocked registers a Locked Folder file as held back (status locked)
+// if it is new, and reports whether it is still held back. A file whose
+// status was later set to pending (approved after review) is not held back
+// and should be uploaded. Identity rules are the same as RegisterMedia.
+func (s *Store) RegisterLocked(sourcePath, sourceZip, zipEntry string) (held bool, err error) {
+	if sourceZip == "" {
+		_, err = s.db.Exec(
+			`INSERT INTO media_items (source_path, status) VALUES (?, 'locked')
+			      ON CONFLICT(source_path) DO NOTHING`,
+			sourcePath,
+		)
+	} else {
+		_, err = s.db.Exec(
+			`INSERT INTO media_items (source_path, source_zip, zip_entry, status)
+			      VALUES (?, ?, ?, 'locked')
+			      ON CONFLICT(source_zip, zip_entry) WHERE source_zip IS NOT NULL AND zip_entry IS NOT NULL
+			      DO UPDATE SET source_path = excluded.source_path`,
+			sourcePath, sourceZip, zipEntry,
+		)
+	}
+	if err != nil {
+		return false, err
+	}
+	var status string
+	if err := s.db.QueryRow(`SELECT status FROM media_items WHERE source_path = ?`, sourcePath).Scan(&status); err != nil {
+		return false, err
+	}
+	return Status(status) == StatusLocked, nil
+}
+
 // IsDone reports whether a media file needs no further upload attempts: it
-// is complete, or permanently too large for the API. Zip-mode files are
+// is complete, permanently too large for the API, or held back (locked). Zip-mode files are
 // looked up by (sourceZip, zipEntry), directory-mode files by sourcePath.
 func (s *Store) IsDone(sourceZip, zipEntry, sourcePath string) (bool, error) {
 	var status string
@@ -190,7 +224,11 @@ func (s *Store) IsDone(sourceZip, zipEntry, sourcePath string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return Status(status) == StatusComplete || Status(status) == StatusTooLarge, nil
+	switch Status(status) {
+	case StatusComplete, StatusTooLarge, StatusLocked:
+		return true, nil
+	}
+	return false, nil
 }
 
 // SetMediaUploadToken records the upload token after the byte-upload step.
@@ -247,15 +285,15 @@ func (s *Store) GetPendingMedia() ([]MediaItem, error) {
 		        COALESCE(upload_token, ''),
 		        status
 		   FROM media_items
-		  WHERE status NOT IN ('complete', 'too_large')
+		  WHERE status NOT IN ('complete', 'too_large', 'locked')
 		  ORDER BY id ASC`,
 	)
 }
 
-// LargeFileItem is returned by GetLargeFileErrors and holds enough context
-// for the user to locate and manually upload a file that exceeded the
-// Google Photos API size limit.
-type LargeFileItem struct {
+// ManualItem is a file the user must handle by hand: one too large for the
+// API (GetLargeFileErrors) or one held back from the Locked Folder
+// (GetLockedFiles). It holds enough context to find the file again.
+type ManualItem struct {
 	SourcePath string
 	SourceZip  string // empty in dir mode
 	ZipEntry   string // path inside SourceZip; empty in dir mode
@@ -266,30 +304,38 @@ type LargeFileItem struct {
 // GetLargeFileErrors returns all media_items that failed because the file was
 // too large for the Google Photos API (HTTP 413 / "Uploaded photo must not
 // have more than N bytes").
-func (s *Store) GetLargeFileErrors() ([]LargeFileItem, error) {
+func (s *Store) GetLargeFileErrors() ([]ManualItem, error) {
+	return s.queryManual(`
+		 WHERE status = 'too_large'
+		    OR (status = 'error'
+		   AND (error_message LIKE '%HTTP 413%'
+		     OR error_message LIKE '%too large%'
+		     OR error_message LIKE '%exceeds%'
+		     OR error_message LIKE '%FILE_SIZE_TOO_LARGE%'))`)
+}
+
+// GetLockedFiles returns the Locked Folder files held back from upload.
+func (s *Store) GetLockedFiles() ([]ManualItem, error) {
+	return s.queryManual(` WHERE status = 'locked'`)
+}
+
+func (s *Store) queryManual(where string) ([]ManualItem, error) {
 	rows, err := s.db.Query(`
 		SELECT source_path,
 		       COALESCE(source_zip, ''),
 		       COALESCE(zip_entry, ''),
 		       COALESCE(album_name, ''),
 		       COALESCE(error_message, '')
-		  FROM media_items
-		 WHERE status = 'too_large'
-		    OR (status = 'error'
-		   AND (error_message LIKE '%HTTP 413%'
-		     OR error_message LIKE '%too large%'
-		     OR error_message LIKE '%exceeds%'
-		     OR error_message LIKE '%FILE_SIZE_TOO_LARGE%'))
-		 ORDER BY source_zip ASC, source_path ASC`,
-	)
+		  FROM media_items` + where + `
+		 ORDER BY source_zip ASC, source_path ASC`)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
 
-	var items []LargeFileItem
+	var items []ManualItem
 	for rows.Next() {
-		var it LargeFileItem
+		var it ManualItem
 		if err := rows.Scan(&it.SourcePath, &it.SourceZip, &it.ZipEntry, &it.AlbumName, &it.ErrorMsg); err != nil {
 			return nil, err
 		}
@@ -369,6 +415,7 @@ type Stats struct {
 	PendingMedia   int
 	ErrorMedia     int
 	TooLargeMedia  int
+	LockedMedia    int
 	TotalAlbums    int
 	CompleteAlbums int
 }
@@ -390,9 +437,10 @@ func (s *Store) GetStats() (*Stats, error) {
 		       COALESCE(SUM(CASE WHEN status='complete'                         THEN 1 ELSE 0 END), 0),
 		       COALESCE(SUM(CASE WHEN status IN ('pending','bytes_uploaded')    THEN 1 ELSE 0 END), 0),
 		       COALESCE(SUM(CASE WHEN status='error'                            THEN 1 ELSE 0 END), 0),
-		       COALESCE(SUM(CASE WHEN status='too_large'                        THEN 1 ELSE 0 END), 0)
+		       COALESCE(SUM(CASE WHEN status='too_large'                        THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN status='locked'                           THEN 1 ELSE 0 END), 0)
 		  FROM media_items`,
-	).Scan(&st.TotalMedia, &st.CompleteMedia, &st.PendingMedia, &st.ErrorMedia, &st.TooLargeMedia); err != nil {
+	).Scan(&st.TotalMedia, &st.CompleteMedia, &st.PendingMedia, &st.ErrorMedia, &st.TooLargeMedia, &st.LockedMedia); err != nil {
 		return nil, fmt.Errorf("stats media_items: %w", err)
 	}
 

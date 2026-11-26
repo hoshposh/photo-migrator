@@ -103,6 +103,7 @@ Quick start:
 		newRunCmd(),
 		newStatusCmd(),
 		newLargeFilesCmd(),
+		newLockedFilesCmd(),
 		newConfigCmd(),
 	)
 	return root
@@ -431,6 +432,9 @@ func newStatusCmd() *cobra.Command {
 			if stats.TooLargeMedia > 0 {
 				fmt.Printf("       ⚠ too large  %d  (upload manually: see 'photo-migrator large-files')\n", stats.TooLargeMedia)
 			}
+			if stats.LockedMedia > 0 {
+				fmt.Printf("       🔒 held back %d  (Locked Folder, not uploaded: see 'photo-migrator locked-files')\n", stats.LockedMedia)
+			}
 			fmt.Printf("  🗂   Albums         %d / %d created\n", stats.CompleteAlbums, stats.TotalAlbums)
 
 			if stats.TotalZips > 0 {
@@ -450,24 +454,32 @@ func newStatusCmd() *cobra.Command {
 // large-files
 // ─────────────────────────────────────────────────────────────
 
-// largeFileReport is the JSON-serialisable representation of one large file.
-type largeFileReport struct {
+// manualFileReport is the JSON-serialisable representation of one file the
+// user must handle by hand (too large, or held back from the Locked Folder).
+type manualFileReport struct {
 	File        string `json:"file"`
 	SourceZip   string `json:"source_zip,omitempty"`
 	InZipPath   string `json:"in_zip_path,omitempty"`
 	ExtractedTo string `json:"extracted_to,omitempty"`
 	Album       string `json:"album,omitempty"`
-	Error       string `json:"error"`
+	Error       string `json:"error,omitempty"`
+}
+
+// manualReport describes a report of files the user must handle by hand.
+type manualReport struct {
+	use, short, long string
+	extractHelp      string
+	empty            string   // printed when there is nothing to report
+	title            string   // header; %d is the file count
+	advice           []string // lines printed under the header
+	query            func(*store.Store) ([]store.ManualItem, error)
 }
 
 func newLargeFilesCmd() *cobra.Command {
-	var format string
-	var extractDir string
-
-	cmd := &cobra.Command{
-		Use:   "large-files",
-		Short: "Report files that were too large to upload via the API",
-		Long: `Queries the database for media items that failed because they exceeded
+	return newManualFilesCmd(manualReport{
+		use:   "large-files",
+		short: "Report files that were too large to upload via the API",
+		long: `Queries the database for media items that failed because they exceeded
 the Google Photos API file-size limit (~200 MB). These files were never
 uploaded and must be added to your library manually via the web UI:
 
@@ -482,6 +494,53 @@ Flags:
   --format json    Emit machine-readable JSON instead of a text table
   --extract <dir>  Re-extract the large files from their source zips into
                    <dir> so you can upload them immediately from disk`,
+		extractHelp: "re-extract large files from their source zips into this directory",
+		empty:       "  ✓ No files were rejected for being too large.",
+		title:       "⚠️  Large Files Report — %d file(s) too large for the Google Photos API",
+		advice:      []string{"  These files must be uploaded manually via:", "  → https://photos.google.com/"},
+		query:       (*store.Store).GetLargeFileErrors,
+	})
+}
+
+func newLockedFilesCmd() *cobra.Command {
+	return newManualFilesCmd(manualReport{
+		use:   "locked-files",
+		short: "List Locked Folder files held back from upload",
+		long: `Lists photos and videos from your Google Photos Locked Folder. They are
+private, and the Google Photos API cannot add files to the destination
+account's Locked Folder, so photo-migrator does not upload them: they would
+appear in the main library, visible on every device.
+
+To move them over yourself:
+  1. Extract them:  photo-migrator locked-files --extract <dir>
+  2. Add them to the destination account (for example from your phone).
+  3. In the Google Photos mobile app, select them and choose
+     "Move to Locked Folder".
+
+Flags:
+  --format json    Emit machine-readable JSON instead of a text table
+  --extract <dir>  Extract the held-back files from their source zips into <dir>`,
+		extractHelp: "extract the held-back files from their source zips into this directory",
+		empty:       "  ✓ No Locked Folder files are being held back.",
+		title:       "🔒  Locked Folder — %d file(s) held back (not uploaded, to keep them private)",
+		advice: []string{
+			"  The Google Photos API cannot add files to a Locked Folder. To move them",
+			"  yourself: extract them (--extract <dir>), add them to the destination",
+			"  account, then use \"Move to Locked Folder\" in the Google Photos mobile app.",
+		},
+		query: (*store.Store).GetLockedFiles,
+	})
+}
+
+// newManualFilesCmd builds a report command (large-files, locked-files).
+func newManualFilesCmd(spec manualReport) *cobra.Command {
+	var format string
+	var extractDir string
+
+	cmd := &cobra.Command{
+		Use:   spec.use,
+		Short: spec.short,
+		Long:  spec.long,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			logger := buildLogger()
 			st, err := store.Open(viperPath("db-path"))
@@ -494,21 +553,21 @@ Flags:
 				}
 			}()
 
-			items, err := st.GetLargeFileErrors()
+			items, err := spec.query(st)
 			if err != nil {
-				return fmt.Errorf("query large files: %w", err)
+				return fmt.Errorf("query %s: %w", spec.use, err)
 			}
 
 			if len(items) == 0 {
-				fmt.Println("\n  ✓ No files were rejected for being too large.")
+				fmt.Println()
+				fmt.Println(spec.empty)
 				fmt.Println()
 				return nil
 			}
 
-			// Build report rows, deriving the in-zip relative path from source_path.
-			reports := make([]largeFileReport, 0, len(items))
+			reports := make([]manualFileReport, 0, len(items))
 			for _, it := range items {
-				rep := largeFileReport{
+				rep := manualFileReport{
 					File:      filepath.Base(it.SourcePath),
 					SourceZip: it.SourceZip,
 					Album:     it.AlbumName,
@@ -522,14 +581,13 @@ Flags:
 
 			// --extract: pull the files back out of their source zips.
 			if extractDir != "" {
-				if err := extractLargeFiles(items, extractDir, logger); err != nil {
+				if err := extractManualFiles(items, extractDir, logger); err != nil {
 					return fmt.Errorf("extract: %w", err)
 				}
 				// Annotate each report with where the file landed.
 				for i, it := range items {
 					if it.SourceZip != "" {
-						inZip := zipEntryOf(it)
-						reports[i].ExtractedTo = filepath.Join(extractDir, filepath.FromSlash(inZip))
+						reports[i].ExtractedTo = filepath.Join(extractDir, filepath.FromSlash(zipEntryOf(it)))
 					} else {
 						// Dir mode: original path is stable.
 						reports[i].ExtractedTo = it.SourcePath
@@ -539,22 +597,21 @@ Flags:
 
 			switch format {
 			case "json":
-				return printLargeFilesJSON(reports)
+				return printManualFilesJSON(reports)
 			default:
-				return printLargeFilesText(reports, extractDir)
+				return printManualFilesText(spec, reports, extractDir)
 			}
 		},
 	}
 
 	cmd.Flags().StringVar(&format, "format", "text", "output format: text | json")
-	cmd.Flags().StringVar(&extractDir, "extract", "",
-		"re-extract large files from their source zips into this directory")
+	cmd.Flags().StringVar(&extractDir, "extract", "", spec.extractHelp)
 	return cmd
 }
 
 // zipEntryOf returns the item's path inside its source zip: the recorded
 // zip_entry, or (for rows predating that column) one derived from source_path.
-func zipEntryOf(it store.LargeFileItem) string {
+func zipEntryOf(it store.ManualItem) string {
 	if it.ZipEntry != "" {
 		return it.ZipEntry
 	}
@@ -583,16 +640,16 @@ func inZipPath(sourcePath, sourceZip string) string {
 	return filepath.Base(sourcePath)
 }
 
-// extractLargeFiles groups items by their source zip and calls
+// extractManualFiles groups items by their source zip and calls
 // takeout.ExtractFiles for each zip, pulling only the oversized files.
-func extractLargeFiles(items []store.LargeFileItem, destDir string, logger *zap.Logger) error {
+func extractManualFiles(items []store.ManualItem, destDir string, logger *zap.Logger) error {
 	// Group by source zip.
 	type entry struct {
-		item  store.LargeFileItem
+		item  store.ManualItem
 		inZip string
 	}
 	zipGroups := make(map[string][]entry)
-	var dirItems []store.LargeFileItem
+	var dirItems []store.ManualItem
 
 	for _, it := range items {
 		if it.SourceZip == "" {
@@ -610,7 +667,7 @@ func extractLargeFiles(items []store.LargeFileItem, destDir string, logger *zap.
 		for _, e := range entries {
 			want[e.inZip] = struct{}{}
 		}
-		logger.Info("extracting large files from zip",
+		logger.Info("extracting files from zip",
 			zap.String("zip", filepath.Base(zipPath)),
 			zap.Int("count", len(want)),
 		)
@@ -628,11 +685,12 @@ func extractLargeFiles(items []store.LargeFileItem, destDir string, logger *zap.
 	return nil
 }
 
-func printLargeFilesText(reports []largeFileReport, extractDir string) error {
-	fmt.Printf("\n  ⚠️  Large Files Report — %d file(s) too large for the Google Photos API\n", len(reports))
+func printManualFilesText(spec manualReport, reports []manualFileReport, extractDir string) error {
+	fmt.Printf("\n  "+spec.title+"\n", len(reports))
 	fmt.Println()
-	fmt.Println("  These files must be uploaded manually via:")
-	fmt.Println("  → https://photos.google.com/")
+	for _, line := range spec.advice {
+		fmt.Println(line)
+	}
 	if extractDir != "" {
 		fmt.Printf("  → Files extracted to: %s\n", extractDir)
 	}
@@ -662,7 +720,7 @@ func printLargeFilesText(reports []largeFileReport, extractDir string) error {
 	return nil
 }
 
-func printLargeFilesJSON(reports []largeFileReport) error {
+func printManualFilesJSON(reports []manualFileReport) error {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(reports)
@@ -989,10 +1047,27 @@ func processDirectory(ctx context.Context, dir, sourceZip string, st *store.Stor
 		err := takeout.WalkDirectory(walkCtx, dir, sourceZip, func(path, zipEntry string) (bool, error) {
 			return st.IsDone(sourceZip, zipEntry, path)
 		}, func(j takeout.MigrationJob) {
-			// Register in DB before handing off to the worker pool. Skipped on
-			// dry runs: rows are keyed by (staging) path, and rows a real run
-			// never revisits would keep their zip incomplete forever.
-			if !pool.DryRun() {
+			// Locked Folder files are private: hold them back unless a review
+			// has approved them (status set back to pending).
+			if j.Locked {
+				if pool.DryRun() {
+					logger.Info("dry-run: Locked Folder file would be held back", zap.String("file", filepath.Base(j.MediaPath)))
+					return
+				}
+				held, err := st.RegisterLocked(j.MediaPath, j.SourceZip, j.ZipEntry)
+				if err != nil {
+					logger.Warn("register locked file", zap.String("path", j.MediaPath), zap.Error(err))
+					return // never upload a Locked Folder file we could not record
+				}
+				if held {
+					logger.Info("held back: Locked Folder file not uploaded (see 'photo-migrator locked-files')",
+						zap.String("file", filepath.Base(j.MediaPath)))
+					return
+				}
+			} else if !pool.DryRun() {
+				// Register in DB before handing off to the worker pool. Skipped on
+				// dry runs: rows are keyed by (staging) path, and rows a real run
+				// never revisits would keep their zip incomplete forever.
 				if err := st.RegisterMedia(j.MediaPath, j.SourceZip, j.ZipEntry, j.AlbumName); err != nil {
 					logger.Warn("register media", zap.String("path", j.MediaPath), zap.Error(err))
 				}

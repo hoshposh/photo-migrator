@@ -180,3 +180,52 @@ func TestMigration_ResetsFalseDryRunCompletions(t *testing.T) {
 	check(`SELECT photos_media_id FROM media_items WHERE zip_entry = ?`, "b.jpg", "AO7vpWreal")
 	check(`SELECT status FROM zip_archives WHERE zip_path = ?`, realZip, "complete")
 }
+
+// Break caught: Locked Folder rows registered as pending before files were
+// held back (or left in error) being uploaded by the next run.
+func TestMigration_HoldsBackExistingLockedFolderRows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "m.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	goose.SetBaseFS(embedMigrations)
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		t.Fatal(err)
+	}
+	goose.SetLogger(goose.NopLogger())
+	if err := goose.UpTo(db, "migrations", 4); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO media_items (source_path, source_zip, zip_entry, status) VALUES
+		('/s/z/Takeout/Google Photos/Locked Folder/p.jpg', '/t/z.zip', 'Takeout/Google Photos/Locked Folder/p.jpg', 'pending'),
+		('/s/z/Takeout/Google Photos/Locked Folder/e.jpg', '/t/z.zip', 'Takeout/Google Photos/Locked Folder/e.jpg', 'error'),
+		('/s/z/Takeout/Google Photos/Locked Folder/c.jpg', '/t/z.zip', 'Takeout/Google Photos/Locked Folder/c.jpg', 'complete'),
+		('/s/z/Takeout/Google Photos/Trip/t.jpg',          '/t/z.zip', 'Takeout/Google Photos/Trip/t.jpg',          'pending'),
+		('/photos/Locked Folder/d.jpg',                    NULL,       NULL,                                        'pending')`); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+	want := map[string]string{
+		"/s/z/Takeout/Google Photos/Locked Folder/p.jpg": "locked",
+		"/s/z/Takeout/Google Photos/Locked Folder/e.jpg": "locked",
+		"/s/z/Takeout/Google Photos/Locked Folder/c.jpg": "complete", // already uploaded: leave alone
+		"/s/z/Takeout/Google Photos/Trip/t.jpg":          "pending",
+		"/photos/Locked Folder/d.jpg":                    "locked", // dir mode
+	}
+	for p, w := range want {
+		var got string
+		if err := st.db.QueryRow(`SELECT status FROM media_items WHERE source_path = ?`, p).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != w {
+			t.Errorf("%s: status = %q, want %q", p, got, w)
+		}
+	}
+}

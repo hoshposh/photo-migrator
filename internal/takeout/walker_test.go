@@ -110,11 +110,39 @@ func TestAlbumFromPath(t *testing.T) {
 		{"Takeout/Google Photos/Photos from 2019/a.jpg", ""},
 		{"Takeout/Google Photos/Archive/a.jpg", ""},
 		{"Takeout/Google Photos/Failed Videos/a.mp4", ""},
+		{"Takeout/Google Photos/Locked Folder/a.jpg", ""},
 		{"Takeout/Google Photos/a.jpg", ""},
 	}
 	for _, c := range cases {
 		if got := albumFromPath(filepath.Join(root, filepath.FromSlash(c.rel)), root); got != c.want {
 			t.Errorf("albumFromPath(%q) = %q, want %q", c.rel, got, c.want)
 		}
+	}
+}
+
+// Break caught: the walker not flagging Locked Folder files, so the caller
+// cannot hold them back.
+func TestWalkDirectory_FlagsLockedFolderFiles(t *testing.T) {
+	dir := t.TempDir()
+	for _, rel := range []string{"Takeout/Google Photos/Locked Folder/s.jpg", "Takeout/Google Photos/Trip/t.jpg"} {
+		p := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	locked := map[string]bool{}
+	err := WalkDirectory(context.Background(), dir, "/t/takeout-001.zip",
+		func(string, string) (bool, error) { return false, nil },
+		func(j MigrationJob) { locked[filepath.Base(j.MediaPath)] = j.Locked },
+		zap.NewNop(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !locked["s.jpg"] || locked["t.jpg"] {
+		t.Errorf("Locked flags = %v, want s.jpg locked and t.jpg not", locked)
 	}
 }

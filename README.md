@@ -301,6 +301,21 @@ You can then open [photos.google.com](https://photos.google.com/), click
 
 ---
 
+## Locked Folder files are held back
+
+Photos and videos from your Google Photos **Locked Folder** are private, and the Google Photos API cannot add files to the destination account's Locked Folder. Uploading them would put them in the main library, visible on every device. So `run` **does not upload them**: they are recorded with status `locked`, they don't stop their zip from completing, and `status` shows how many there are.
+
+To list them, or extract them to move them over yourself:
+
+```bash
+./photo-migrator locked-files
+./photo-migrator locked-files --extract ~/locked-to-review
+```
+
+Add the extracted files to the destination account (for example from your phone), then use **Move to Locked Folder** in the Google Photos mobile app.
+
+---
+
 ## Stopping and resuming
 
 Press **Ctrl+C** once to stop gracefully: no new uploads start, uploads already in progress are allowed to finish, and the tool exits with code 130. Press **Ctrl+C** a second time to quit immediately; any upload cut off that way is simply retried on the next run.
@@ -344,6 +359,8 @@ photo-migrator status
 photo-migrator large-files                     # report files too large for the API
 photo-migrator large-files --format json       # machine-readable JSON report
 photo-migrator large-files --extract <dir>     # re-extract oversized files for manual upload
+photo-migrator locked-files                    # list Locked Folder files held back from upload
+photo-migrator locked-files --extract <dir>    # extract them to handle by hand
 ```
 
 Flags in brackets are optional if set in the config file. Use `--help` on any command for full flag documentation.
