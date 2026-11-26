@@ -188,15 +188,29 @@ func copyFile(src, dst string) (err error) {
 	return err
 }
 
-// firstLine condenses exiftool's output to its first message, without the
-// file path it appends, so a failure is one readable log line.
+// firstLine condenses exiftool's output to one message, without the file
+// path it appends, so a failure is one readable log line. It reports the
+// first "Error:" line when there is one: exiftool often prints a harmless
+// warning (e.g. "[minor] ... Fixed.") before the error that stopped it.
 func firstLine(output []byte, path string, runErr error) string {
+	clean := func(line string) string {
+		return strings.TrimSpace(strings.TrimSuffix(line, " - "+path))
+	}
+	first := ""
 	for _, line := range strings.Split(string(output), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		return strings.TrimSpace(strings.TrimSuffix(line, " - "+path))
+		if strings.HasPrefix(line, "Error:") {
+			return clean(line)
+		}
+		if first == "" {
+			first = clean(line)
+		}
+	}
+	if first != "" {
+		return first
 	}
 	return runErr.Error()
 }
