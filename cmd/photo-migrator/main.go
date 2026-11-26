@@ -599,7 +599,7 @@ func newLargeFilesCmd() *cobra.Command {
 		use:   "large-files",
 		short: "Report files that were too large to upload via the API",
 		long: `Queries the database for media items that failed because they exceeded
-the Google Photos API file-size limit (~200 MB). These files were never
+the Google Photos API photo size limit (~200 MB; videos may be larger). These files were never
 uploaded and must be added to your library manually via the web UI:
 
   https://photos.google.com/
