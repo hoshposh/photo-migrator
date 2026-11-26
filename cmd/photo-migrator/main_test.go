@@ -449,7 +449,7 @@ func TestProcessZips_InterruptFinishesInFlightUpload(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- processZips(ctx, []string{zipPath}, t.TempDir(), st, pool, logger) }()
+	go func() { done <- processZips(ctx, []string{zipPath}, t.TempDir(), st, pool, logger, nil) }()
 
 	select {
 	case <-started:
@@ -583,7 +583,7 @@ func TestProcessZips_StopsOnRejectedSignIn(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- processZips(context.Background(), []string{zip1, zip2}, t.TempDir(), st, pool, logger)
+		done <- processZips(context.Background(), []string{zip1, zip2}, t.TempDir(), st, pool, logger, nil)
 	}()
 	var runErr error
 	select {
@@ -683,7 +683,7 @@ func TestProcessZips_TooLargeFileIsNotRetried(t *testing.T) {
 	staging := t.TempDir()
 
 	for run := 1; run <= 2; run++ {
-		if err := processZips(context.Background(), []string{zipPath}, staging, st, pool, logger); err != nil {
+		if err := processZips(context.Background(), []string{zipPath}, staging, st, pool, logger, nil); err != nil {
 			t.Fatalf("run %d: %v", run, err)
 		}
 	}
@@ -745,7 +745,7 @@ func TestProcessZips_StagingDirChangeDoesNotReupload(t *testing.T) {
 	pool := pipeline.NewPool(pipeline.Config{Workers: 1, Logger: logger}, client, st)
 
 	for _, staging := range []string{t.TempDir(), t.TempDir()} { // two different staging dirs
-		if err := processZips(context.Background(), []string{zipPath}, staging, st, pool, logger); err != nil {
+		if err := processZips(context.Background(), []string{zipPath}, staging, st, pool, logger, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -871,7 +871,7 @@ func newLockedFixture(t *testing.T) *lockedFixture {
 
 func (fx *lockedFixture) run(t *testing.T) {
 	t.Helper()
-	if err := processZips(context.Background(), []string{fx.zipPath}, fx.staging, fx.st, fx.pool, zap.NewNop()); err != nil {
+	if err := processZips(context.Background(), []string{fx.zipPath}, fx.staging, fx.st, fx.pool, zap.NewNop(), nil); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -1041,7 +1041,7 @@ func TestProcessZips_UnrecognisedVideos(t *testing.T) {
 	pool := pipeline.NewPool(pipeline.Config{Workers: 2, Logger: logger}, client, st)
 	staging := t.TempDir()
 	for run := 0; run < 2; run++ {
-		if err := processZips(context.Background(), []string{zipPath}, staging, st, pool, logger); err != nil {
+		if err := processZips(context.Background(), []string{zipPath}, staging, st, pool, logger, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1162,7 +1162,7 @@ func TestProcessZips_LogsSkippedFilesPerZip(t *testing.T) {
 	logger := zap.New(core)
 	pool := pipeline.NewPool(pipeline.Config{Workers: 1, DryRun: true, Logger: logger}, nil, st)
 
-	if err := processZips(context.Background(), []string{zipPath}, t.TempDir(), st, pool, logger); err != nil {
+	if err := processZips(context.Background(), []string{zipPath}, t.TempDir(), st, pool, logger, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1199,7 +1199,7 @@ func TestProcessZips_SummarisesHeldBackFilesPerZip(t *testing.T) {
 	logger := zap.New(core)
 	pool := pipeline.NewPool(pipeline.Config{Workers: 1, Logger: logger}, nil, st)
 
-	if err := processZips(context.Background(), []string{zipPath}, t.TempDir(), st, pool, logger); err != nil {
+	if err := processZips(context.Background(), []string{zipPath}, t.TempDir(), st, pool, logger, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1263,7 +1263,7 @@ func TestProcessZips_EveryLineNamesItsZip(t *testing.T) {
 	logger := zap.New(core)
 	pool := pipeline.NewPool(pipeline.Config{Workers: 2, Logger: logger}, client, st)
 
-	if err := processZips(context.Background(), []string{zipPath}, t.TempDir(), st, pool, logger); err != nil {
+	if err := processZips(context.Background(), []string{zipPath}, t.TempDir(), st, pool, logger, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1385,7 +1385,7 @@ func (fx *batchFixture) run(t *testing.T, entries map[string]string) *store.Stor
 	}
 	logger := zap.NewNop()
 	pool := pipeline.NewPool(pipeline.Config{Workers: 4, Logger: logger}, client, st)
-	if err := processZips(context.Background(), []string{zipPath}, t.TempDir(), st, pool, logger); err != nil {
+	if err := processZips(context.Background(), []string{zipPath}, t.TempDir(), st, pool, logger, nil); err != nil {
 		t.Fatal(err)
 	}
 	return st
@@ -1516,7 +1516,9 @@ func TestPoolInFlightListsUploadsInProgress(t *testing.T) {
 	logger := zap.NewNop()
 	pool := pipeline.NewPool(pipeline.Config{Workers: 1, Logger: logger}, client, st)
 	done := make(chan error, 1)
-	go func() { done <- processZips(context.Background(), []string{zipPath}, t.TempDir(), st, pool, logger) }()
+	go func() {
+		done <- processZips(context.Background(), []string{zipPath}, t.TempDir(), st, pool, logger, nil)
+	}()
 
 	select {
 	case <-received:
@@ -1626,5 +1628,311 @@ func TestProcessZips_RecordsDates(t *testing.T) {
 	}
 	if !b.GoogleTime.Equal(wantGoogle) {
 		t.Errorf("b google = %v", b.GoogleTime)
+	}
+}
+
+// livePhotoFixture is a fake Photos API (recording the body of every byte
+// upload) plus a ledger, for the Live Photo hold-back tests.
+type livePhotoFixture struct {
+	mu       sync.Mutex
+	uploaded []string // upload bodies
+	st       *store.Store
+	dbPath   string
+	client   *photos.Client
+}
+
+func newLivePhotoFixture(t *testing.T) *livePhotoFixture {
+	t.Helper()
+	fx := &livePhotoFixture{}
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/uploads"):
+			body, _ := io.ReadAll(r.Body)
+			fx.mu.Lock()
+			fx.uploaded = append(fx.uploaded, string(body))
+			fx.mu.Unlock()
+			_, _ = io.WriteString(w, nextToken())
+		case strings.HasSuffix(r.URL.Path, "/mediaItems:batchCreate"):
+			echoBatchCreate(w, r, nil)
+		case strings.HasSuffix(r.URL.Path, "/albums"):
+			_, _ = io.WriteString(w, `{"id":"album-1","title":"x"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(fake.Close)
+	target, _ := url.Parse(fake.URL)
+	fx.client = photos.New(&http.Client{Transport: rewriteTransport{target}})
+	fx.dbPath = filepath.Join(t.TempDir(), "m.db")
+	st, err := store.Open(fx.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	fx.st = st
+	return fx
+}
+
+// run registers the zips, builds the pairing index from takeoutDir (the zips
+// still on disk) plus the ledger, and runs processZips over them.
+func (fx *livePhotoFixture) run(t *testing.T, takeoutDir string, zips []string) {
+	t.Helper()
+	for _, z := range zips {
+		if err := fx.st.RegisterZip(z); err != nil {
+			t.Fatal(err)
+		}
+	}
+	logger := zap.NewNop()
+	pairs, err := buildLivePairs(context.Background(), takeoutDir, true, fx.st, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := pipeline.NewPool(pipeline.Config{Workers: 2, Logger: logger}, fx.client, fx.st)
+	if err := processZips(context.Background(), zips, t.TempDir(), fx.st, pool, logger, pairs); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (fx *livePhotoFixture) uploads() map[string]bool {
+	fx.mu.Lock()
+	defer fx.mu.Unlock()
+	out := map[string]bool{}
+	for _, b := range fx.uploaded {
+		out[b] = true
+	}
+	return out
+}
+
+func (fx *livePhotoFixture) status(t *testing.T, entrySuffix string) string {
+	t.Helper()
+	db, err := sql.Open("sqlite", fx.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	var s string
+	if err := db.QueryRow(`SELECT status FROM media_items WHERE zip_entry LIKE ?`, "%"+entrySuffix).Scan(&s); err != nil {
+		return "(no row: " + err.Error() + ")"
+	}
+	return s
+}
+
+// Break caught: the video half of an iPhone Live Photo being uploaded as a
+// separate video next to its photo, while a standalone video still uploads.
+func TestProcessZips_HoldsBackLivePhotoVideo(t *testing.T) {
+	fx := newLivePhotoFixture(t)
+	dir := t.TempDir()
+	zipPath := filepath.Join(dir, "takeout-001.zip")
+	writeZipEntries(t, zipPath, map[string]string{
+		"Takeout/Google Photos/Photos from 2023/IMG_7297.HEIC": "STILL",
+		"Takeout/Google Photos/Photos from 2023/IMG_7297.MP4":  "LIVE-VIDEO",
+		"Takeout/Google Photos/Photos from 2023/VID_1.mp4":     "STANDALONE",
+	})
+	fx.run(t, dir, []string{zipPath})
+
+	if got := fx.status(t, "IMG_7297.MP4"); got != "motion_video" {
+		t.Errorf("IMG_7297.MP4 status = %q, want motion_video", got)
+	}
+	up := fx.uploads()
+	if up["LIVE-VIDEO"] {
+		t.Error("the Live Photo video half was uploaded")
+	}
+	if !up["STILL"] || !up["STANDALONE"] {
+		t.Errorf("uploads = %v, want the still and the standalone video", up)
+	}
+	if got := fx.status(t, "VID_1.mp4"); got != "complete" {
+		t.Errorf("VID_1.mp4 status = %q, want complete", got)
+	}
+}
+
+// Break caught: a video half held back only when its still is in the same
+// zip. Takeout splits a pair across zips, and the still's zip may already be
+// finished and deleted; the ledger remembers it.
+func TestProcessZips_LivePhotoStillInDeletedZip(t *testing.T) {
+	fx := newLivePhotoFixture(t)
+	dir := t.TempDir()
+	zip1 := filepath.Join(t.TempDir(), "takeout-001.zip") // already done and deleted
+	zip2 := filepath.Join(dir, "takeout-002.zip")
+	writeZipEntries(t, zip2, map[string]string{
+		"Takeout/Google Photos/Photos from 2023/IMG_8.MOV": "LIVE-VIDEO",
+	})
+	if err := fx.st.RegisterZip(zip1); err != nil {
+		t.Fatal(err)
+	}
+	stillEntry := "Takeout/Google Photos/Photos from 2023/IMG_8.HEIC"
+	if err := fx.st.RegisterMedia("/old-stage/IMG_8.HEIC", zip1, stillEntry, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := fx.st.SetMediaComplete("/old-stage/IMG_8.HEIC", "id-8"); err != nil {
+		t.Fatal(err)
+	}
+
+	fx.run(t, dir, []string{zip2})
+
+	if got := fx.status(t, "IMG_8.MOV"); got != "motion_video" {
+		t.Errorf("IMG_8.MOV status = %q, want motion_video", got)
+	}
+	if fx.uploads()["LIVE-VIDEO"] {
+		t.Error("the Live Photo video half was uploaded")
+	}
+}
+
+// Break caught: a video half the user released (row set back to pending)
+// being held back again on the next run instead of uploaded.
+func TestProcessZips_ReleasedLivePhotoVideoUploads(t *testing.T) {
+	fx := newLivePhotoFixture(t)
+	dir := t.TempDir()
+	zipPath := filepath.Join(dir, "takeout-001.zip")
+	writeZipEntries(t, zipPath, map[string]string{
+		"Takeout/Google Photos/Photos from 2023/IMG_9.HEIC": "STILL",
+		"Takeout/Google Photos/Photos from 2023/IMG_9.MP4":  "LIVE-VIDEO",
+	})
+	if err := fx.st.RegisterZip(zipPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := fx.st.RegisterMedia("/old-stage/IMG_9.MP4", zipPath, "Takeout/Google Photos/Photos from 2023/IMG_9.MP4", ""); err != nil {
+		t.Fatal(err) // a pending row: held back before, then released
+	}
+
+	fx.run(t, dir, []string{zipPath})
+
+	if !fx.uploads()["LIVE-VIDEO"] {
+		t.Error("the released Live Photo video was not uploaded")
+	}
+	if got := fx.status(t, "IMG_9.MP4"); got != "complete" {
+		t.Errorf("IMG_9.MP4 status = %q, want complete", got)
+	}
+}
+
+// Break caught: a Live Photo video from the Locked Folder recorded as
+// motion_video, so releasing it from the motion-videos list would put a
+// private file in the library.
+func TestProcessZips_LockedLivePhotoVideo(t *testing.T) {
+	fx := newLivePhotoFixture(t)
+	dir := t.TempDir()
+	zipPath := filepath.Join(dir, "takeout-001.zip")
+	writeZipEntries(t, zipPath, map[string]string{
+		"Takeout/Google Photos/Locked Folder/IMG_5.HEIC": "SECRET-STILL",
+		"Takeout/Google Photos/Locked Folder/IMG_5.MP4":  "SECRET-VIDEO",
+	})
+	fx.run(t, dir, []string{zipPath})
+
+	if got := fx.status(t, "IMG_5.MP4"); got != "locked" {
+		t.Errorf("IMG_5.MP4 status = %q, want locked", got)
+	}
+	if up := fx.uploads(); len(up) != 0 {
+		t.Errorf("Locked Folder files uploaded: %v", up)
+	}
+}
+
+// Break caught: a dry run writing a row for the held-back video, or not
+// counting it in the per-zip summary.
+func TestDryRun_LivePhotoVideoCountedNotWritten(t *testing.T) {
+	dir := t.TempDir()
+	zipPath := filepath.Join(dir, "takeout-001.zip")
+	writeZipEntries(t, zipPath, map[string]string{
+		"Takeout/Google Photos/Photos from 2023/IMG_7.HEIC": "STILL",
+		"Takeout/Google Photos/Photos from 2023/IMG_7.MP4":  "LIVE-VIDEO",
+	})
+	dbPath := filepath.Join(t.TempDir(), "m.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	if err := st.RegisterZip(zipPath); err != nil {
+		t.Fatal(err)
+	}
+	core, logs := observer.New(zap.InfoLevel)
+	logger := zap.New(core)
+	pairs, err := buildLivePairs(context.Background(), dir, true, st, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := pipeline.NewPool(pipeline.Config{Workers: 1, DryRun: true, Logger: logger}, nil, st)
+	if err := processZips(context.Background(), []string{zipPath}, t.TempDir(), st, pool, logger, pairs); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM media_items`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("media_items rows after dry run = %d, want 0", n)
+	}
+	if found := logs.FilterMessageSnippet("held back 1 motion-photo video(s)").Len(); found != 1 {
+		t.Errorf("want 1 summary line counting the held-back video, got %d: %v", found, logs.All())
+	}
+}
+
+// Break caught: `scan --skipped` not counting Live Photo videos, so its
+// numbers disagree with what a run holds back.
+func TestScanSkipped_CountsLivePhotoVideos(t *testing.T) {
+	takeoutDir := t.TempDir()
+	writeZipEntries(t, filepath.Join(takeoutDir, "takeout-001.zip"), map[string]string{
+		"Takeout/Google Photos/Trip/IMG_1.HEIC": "\x00\x00\x00\x18ftypheic",
+		"Takeout/Google Photos/Trip/IMG_1.MP4":  "\x00\x00\x00\x20ftypisom\x00\x00\x02\x00",
+		"Takeout/Google Photos/Trip/VID_2.mp4":  "\x00\x00\x00\x20ftypisom\x00\x00\x02\x00",
+	})
+
+	isolate(t)
+	var runErr error
+	out := captureStdout(t, func() {
+		runErr = runCLI(t, "scan", "--skipped", "--takeout-dir", takeoutDir, "--format", "json")
+	})
+	if runErr != nil {
+		t.Fatalf("scan --skipped: %v", runErr)
+	}
+	var report struct {
+		Summary map[string]int `json:"summary"`
+	}
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if report.Summary["motion_video_parts"] != 1 || report.Summary["recognised_media"] != 3 {
+		t.Errorf("summary = %v, want motion_video_parts=1 and recognised_media=3", report.Summary)
+	}
+}
+
+// Break caught: directory mode (no zips) not pairing Live Photo halves, or
+// computing their path relative to the wrong root.
+func TestProcessDirectory_HoldsBackLivePhotoVideo(t *testing.T) {
+	fx := newLivePhotoFixture(t)
+	dir := t.TempDir()
+	folder := filepath.Join(dir, "Takeout", "Google Photos", "Photos from 2023")
+	if err := os.MkdirAll(folder, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{"IMG_1.HEIC": "STILL", "IMG_1.MOV": "LIVE-VIDEO", "VID_2.mp4": "STANDALONE"} {
+		if err := os.WriteFile(filepath.Join(folder, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	logger := zap.NewNop()
+	pairs, err := buildLivePairs(context.Background(), dir, false, fx.st, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := pipeline.NewPool(pipeline.Config{Workers: 2, Logger: logger}, fx.client, fx.st)
+	if err := processDirectory(context.Background(), dir, "", fx.st, pool, logger, pairs); err != nil {
+		t.Fatal(err)
+	}
+
+	up := fx.uploads()
+	if up["LIVE-VIDEO"] || !up["STILL"] || !up["STANDALONE"] {
+		t.Errorf("uploads = %v, want the still and the standalone video only", up)
+	}
+	held, err := fx.st.GetMotionVideos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(held) != 1 || filepath.Base(held[0].SourcePath) != "IMG_1.MOV" {
+		t.Errorf("GetMotionVideos = %+v, want just IMG_1.MOV", held)
 	}
 }

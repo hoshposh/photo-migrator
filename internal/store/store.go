@@ -348,6 +348,31 @@ func (s *Store) GetRawPairs() ([]ManualItem, error) {
 	return s.queryManual(` WHERE status = 'raw_pair'`)
 }
 
+// RegisteredEntry identifies one media_items row by where its file came from.
+// SourceZip and ZipEntry are empty for directory-mode rows.
+type RegisteredEntry struct{ SourcePath, SourceZip, ZipEntry string }
+
+// ListRegisteredEntries returns every media_items row, whatever its status.
+func (s *Store) ListRegisteredEntries() ([]RegisteredEntry, error) {
+	rows, err := s.db.Query(`
+		SELECT source_path, COALESCE(source_zip, ''), COALESCE(zip_entry, '')
+		  FROM media_items`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []RegisteredEntry
+	for rows.Next() {
+		var e RegisteredEntry
+		if err := rows.Scan(&e.SourcePath, &e.SourceZip, &e.ZipEntry); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) queryManual(where string) ([]ManualItem, error) {
 	rows, err := s.db.Query(`
 		SELECT source_path,

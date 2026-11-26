@@ -258,7 +258,7 @@ time, even while a migration is running.`,
 				return fmt.Errorf("--takeout-dir is required (or set takeout-dir in config file)")
 			}
 			if skippedOnly {
-				return reportSkipped(takeoutDir, format)
+				return reportSkipped(cmd.Context(), takeoutDir, format)
 			}
 			st, err := store.Open(viperPath("db-path"))
 			if err != nil {
@@ -290,18 +290,27 @@ type skippedFile struct {
 
 // reportSkipped prints every file in the Takeout that a migration would not
 // upload, using the same takeout.Classify rule as a run. Read-only.
-func reportSkipped(takeoutDir, format string) error {
+func reportSkipped(ctx context.Context, takeoutDir, format string) error {
 	var (
 		tally              takeout.Skipped
 		list               []skippedFile
 		recognised, motion int
 		zips               []string
 	)
+	zipMode, err := takeout.IsZipMode(takeoutDir)
+	if err != nil {
+		return err
+	}
+	// The same index a run uses (minus the ledger), so the counts agree.
+	pairs, err := buildLivePairs(ctx, takeoutDir, zipMode, nil, zap.NewNop())
+	if err != nil {
+		return err
+	}
 	visit := func(zipName string) func(string, takeout.Classification) {
 		return func(entry string, c takeout.Classification) {
 			if c.Skip == takeout.SkipNone {
 				recognised++
-				if c.MotionPart {
+				if c.MotionPart || pairs.IsVideoHalf(entry) {
 					motion++
 				}
 				return
@@ -313,10 +322,6 @@ func reportSkipped(takeoutDir, format string) error {
 		}
 	}
 
-	zipMode, err := takeout.IsZipMode(takeoutDir)
-	if err != nil {
-		return err
-	}
 	if zipMode {
 		if zips, err = takeout.ListZips(takeoutDir); err != nil {
 			return err
@@ -1078,7 +1083,7 @@ func runUpload(ctx context.Context, stagingDir string, st *store.Store, pool *pi
 		if err := os.MkdirAll(stagingDir, 0o755); err != nil {
 			return fmt.Errorf("create staging dir: %w", err)
 		}
-		return processZips(ctx, pendingZips, stagingDir, st, pool, logger)
+		return processZips(ctx, pendingZips, stagingDir, st, pool, logger, nil)
 	}
 
 	// Dir mode: upload items already registered in the DB.
@@ -1113,7 +1118,63 @@ func runZipMode(ctx context.Context, takeoutDir, stagingDir string, st *store.St
 	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
 		return fmt.Errorf("create staging dir: %w", err)
 	}
-	return processZips(ctx, pendingZips, stagingDir, st, pool, logger)
+	pairs, err := buildLivePairs(ctx, takeoutDir, true, st, logger)
+	if err != nil {
+		return err
+	}
+	return processZips(ctx, pendingZips, stagingDir, st, pool, logger, pairs)
+}
+
+// buildLivePairs indexes the stills of the whole Takeout (every zip in
+// takeoutDir, or the directory itself) plus every file the ledger has seen,
+// so a Live Photo video is recognised even when its still is in another zip
+// or in a zip that is already done and deleted. takeoutDir == "" uses the
+// ledger only; st == nil skips the ledger (scan).
+func buildLivePairs(ctx context.Context, takeoutDir string, zipMode bool, st *store.Store, logger *zap.Logger) (*takeout.LivePairs, error) {
+	pairs := takeout.NewLivePairs()
+	switch {
+	case takeoutDir == "":
+	case zipMode:
+		zips, err := takeout.ListZips(takeoutDir)
+		if err != nil {
+			return nil, err
+		}
+		failed, err := pairs.AddZips(ctx, zips)
+		if err != nil {
+			return nil, err
+		}
+		for _, z := range failed {
+			logger.Warn("cannot read zip to pair Live Photos; its stills are not considered", zap.String("zip", filepath.Base(z)))
+		}
+	default:
+		// AddDir swallows walk errors, so check the directory exists first.
+		if _, err := os.Stat(takeoutDir); err != nil {
+			return nil, err
+		}
+		if err := pairs.AddDir(takeoutDir); err != nil {
+			return nil, err
+		}
+	}
+	if st == nil {
+		return pairs, nil
+	}
+	entries, err := st.ListRegisteredEntries()
+	if err != nil {
+		return nil, fmt.Errorf("list ledger entries: %w", err)
+	}
+	for _, e := range entries {
+		switch {
+		case e.ZipEntry != "":
+			pairs.Add(e.ZipEntry)
+		case !zipMode && takeoutDir != "":
+			rel, err := filepath.Rel(takeoutDir, e.SourcePath)
+			if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				continue
+			}
+			pairs.Add(filepath.ToSlash(rel))
+		}
+	}
+	return pairs, nil
 }
 
 // processZips extracts and uploads each zip sequentially, cleaning up staging
@@ -1121,7 +1182,7 @@ func runZipMode(ctx context.Context, takeoutDir, stagingDir string, st *store.St
 //
 // In dry-run mode zips are still extracted and walked (so planned uploads are
 // logged) but their status in the ledger is never changed.
-func processZips(ctx context.Context, zips []string, stagingDir string, st *store.Store, pool *pipeline.Pool, logger *zap.Logger) error {
+func processZips(ctx context.Context, zips []string, stagingDir string, st *store.Store, pool *pipeline.Pool, logger *zap.Logger, pairs *takeout.LivePairs) error {
 	setZipStatus := func(zipPath string, status store.Status, errMsg string) error {
 		if pool.DryRun() {
 			return nil
@@ -1157,7 +1218,7 @@ func processZips(ctx context.Context, zips []string, stagingDir string, st *stor
 			return err
 		}
 
-		uploadErr := processDirectory(ctx, extractRoot, zipPath, st, pool, zipLog)
+		uploadErr := processDirectory(ctx, extractRoot, zipPath, st, pool, zipLog, pairs)
 
 		// Remove staging files regardless of success/error — completed items
 		// are tracked in the DB; failures will be re-extracted on the next run.
@@ -1212,7 +1273,9 @@ func interrupted(ctx context.Context, zipPath string, setZipStatus func(string, 
 }
 
 // processDirectory walks a directory, registers and uploads all media files.
-func processDirectory(ctx context.Context, dir, sourceZip string, st *store.Store, pool *pipeline.Pool, logger *zap.Logger) error {
+// pairs (may be nil) recognises the video halves of Live Photos, which are
+// held back like motion-photo videos.
+func processDirectory(ctx context.Context, dir, sourceZip string, st *store.Store, pool *pipeline.Pool, logger *zap.Logger, pairs *takeout.LivePairs) error {
 	jobs := make(chan pipeline.Job, 200)
 	walkErr := make(chan error, 1)
 	// Written by the walker goroutine before it sends on walkErr.
@@ -1267,9 +1330,10 @@ func processDirectory(ctx context.Context, dir, sourceZip string, st *store.Stor
 					logger.Debug("held back: RAW-pair half not uploaded", zap.String("file", filepath.Base(j.MediaPath)))
 					return
 				}
-			} else if j.MotionPart {
-				// The API cannot rebuild a motion photo: its video half would
-				// become a separate video. Hold it back unless released.
+			} else if j.MotionPart || pairs.IsVideoHalf(pairEntry(j, dir)) {
+				// The API cannot rebuild a motion photo or a Live Photo: its
+				// video half would become a separate video. Hold it back
+				// unless released.
 				if pool.DryRun() {
 					heldMotion++
 					logger.Debug("dry-run: motion-photo video would be held back", zap.String("file", filepath.Base(j.MediaPath)))
@@ -1324,6 +1388,19 @@ func processDirectory(ctx context.Context, dir, sourceZip string, st *store.Stor
 	return nil
 }
 
+// pairEntry is the path LivePairs knows a file by: its path inside the zip, or
+// in directory mode its slash path relative to dir.
+func pairEntry(j takeout.MigrationJob, dir string) string {
+	if j.ZipEntry != "" {
+		return j.ZipEntry
+	}
+	rel, err := filepath.Rel(dir, j.MediaPath)
+	if err != nil {
+		return j.MediaPath
+	}
+	return filepath.ToSlash(rel)
+}
+
 // rawPairHeld reports whether the raw-pairs setting holds back this half
 // ("jpeg" or "raw") of a Pixel RAW pair: "jpeg" keeps the JPEG, "raw" keeps
 // the DNG, "both" (default) keeps both.
@@ -1371,7 +1448,11 @@ func logWalkSummary(s takeout.Skipped, heldLocked, heldMotion, heldRaw int, sour
 // runDirMode walks a pre-extracted directory and uploads everything.
 func runDirMode(ctx context.Context, takeoutDir string, st *store.Store, pool *pipeline.Pool, logger *zap.Logger) error {
 	logger.Info("directory mode", zap.String("dir", takeoutDir))
-	return processDirectory(ctx, takeoutDir, "", st, pool, logger)
+	pairs, err := buildLivePairs(ctx, takeoutDir, false, st, logger)
+	if err != nil {
+		return err
+	}
+	return processDirectory(ctx, takeoutDir, "", st, pool, logger, pairs)
 }
 
 // uploadFromDB uploads pending items already registered in the DB (dir mode resume).

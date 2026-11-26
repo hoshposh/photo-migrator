@@ -291,3 +291,52 @@ func TestOpen_SecondConnectionWaitsForLock(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// Break caught: the Live Photo pairing index missing stills whose rows are
+// held back, finished or still pending (it needs every row, any status).
+func TestListRegisteredEntries(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "m.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+
+	if err := st.RegisterMedia("/stage/a/IMG_1.HEIC", "/zips/t1.zip", "Takeout/Google Photos/A/IMG_1.HEIC", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RegisterMedia("/stage/a/IMG_2.HEIC", "/zips/t1.zip", "Takeout/Google Photos/A/IMG_2.HEIC", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetMediaComplete("/stage/a/IMG_2.HEIC", "id-2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.RegisterHeld(StatusMotionVideo, "/stage/a/IMG_2.MP4", "/zips/t1.zip", "Takeout/Google Photos/A/IMG_2.MP4"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.RegisterHeld(StatusLocked, "/stage/b/IMG_3.HEIC", "/zips/t2.zip", "Takeout/Google Photos/Locked Folder/IMG_3.HEIC"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RegisterMedia("/dir/c/IMG_4.JPG", "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.ListRegisteredEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[RegisteredEntry]bool{
+		{"/stage/a/IMG_1.HEIC", "/zips/t1.zip", "Takeout/Google Photos/A/IMG_1.HEIC"}:             true,
+		{"/stage/a/IMG_2.HEIC", "/zips/t1.zip", "Takeout/Google Photos/A/IMG_2.HEIC"}:             true,
+		{"/stage/a/IMG_2.MP4", "/zips/t1.zip", "Takeout/Google Photos/A/IMG_2.MP4"}:               true,
+		{"/stage/b/IMG_3.HEIC", "/zips/t2.zip", "Takeout/Google Photos/Locked Folder/IMG_3.HEIC"}: true,
+		{"/dir/c/IMG_4.JPG", "", ""}: true,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("ListRegisteredEntries = %+v, want %d rows", got, len(want))
+	}
+	for _, e := range got {
+		if !want[e] {
+			t.Errorf("unexpected entry %+v", e)
+		}
+	}
+}
