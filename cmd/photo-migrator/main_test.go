@@ -1547,3 +1547,37 @@ func TestStopReport(t *testing.T) {
 		t.Errorf("stopReport(nil) = %q, want it to say no uploads are in progress", got)
 	}
 }
+
+// Break caught: both halves of a Pixel RAW pair being uploaded (the shot
+// then appears twice) when raw-pairs asks for only one; or the default
+// "both" changing behaviour.
+func TestProcessZips_RawPairs(t *testing.T) {
+	entries := map[string]string{
+		"Takeout/Google Photos/Photos from 2024/PXL_20240920_173608869.RAW-01.MP.COVER.jpg": "\xff\xd8\xff\xe0jpeg",
+		"Takeout/Google Photos/Photos from 2024/PXL_20240920_173608869.RAW-02.ORIGINAL.dng": "II*\x00dng",
+	}
+	for setting, want := range map[string]map[string]string{
+		"both": {"PXL_20240920_173608869.RAW-01.MP.COVER.jpg": "complete", "PXL_20240920_173608869.RAW-02.ORIGINAL.dng": "complete"},
+		"jpeg": {"PXL_20240920_173608869.RAW-01.MP.COVER.jpg": "complete", "PXL_20240920_173608869.RAW-02.ORIGINAL.dng": "raw_pair"},
+		"raw":  {"PXL_20240920_173608869.RAW-01.MP.COVER.jpg": "raw_pair", "PXL_20240920_173608869.RAW-02.ORIGINAL.dng": "complete"},
+	} {
+		t.Run(setting, func(t *testing.T) {
+			viper.Reset()
+			viper.Set("raw-pairs", setting)
+			fx := &batchFixture{}
+			st := fx.run(t, entries)
+			got := fx.statuses(t)
+			for f, w := range want {
+				if got[f][0] != w {
+					t.Errorf("%s: status %q, want %q", f, got[f][0], w)
+				}
+			}
+			if setting != "both" {
+				held, err := st.GetRawPairs()
+				if err != nil || len(held) != 1 {
+					t.Errorf("GetRawPairs = %v, %v; want 1 held-back half", held, err)
+				}
+			}
+		})
+	}
+}

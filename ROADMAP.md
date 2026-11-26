@@ -116,6 +116,8 @@ Every command that changes the database should:
 
 ### 6. Pixel RAW + JPEG pairs appear as two photos
 
+**Status:** built: the `raw-pairs` setting (`both` | `jpeg` | `raw`), status `raw_pair`, and the `raw-pairs` report. Pair counts in `scan --skipped` are not done yet.
+
 **Problem:** Pixel phones save a RAW shot as a JPEG (`PXL_x.RAW-01.MP.COVER.jpg`, which is also a motion photo with its video in `PXL_x.RAW-01.MP.COVER`) and a DNG (`PXL_x.RAW-02.ORIGINAL.dng`). On the phone, Google Photos shows the pair as one photo with a RAW badge. Through the Library API there is no way to link them, so each pair arrives as **two separate items**, the JPEG and the RAW, and the shot appears twice in the library. One real Takeout had 786 such pairs.
 
 **Approach:**

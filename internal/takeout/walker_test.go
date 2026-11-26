@@ -241,6 +241,9 @@ func TestClassify(t *testing.T) {
 		{"Trip/PXL_a.MP", isoHeader("isom"), Classification{MotionPart: true}},
 		{"Trip/talk - 3.12.20", isoHeader("isom"), Classification{UploadName: "talk - 3.12.20.mp4", MimeType: "video/mp4"}},
 		{"Trip/still.bin", isoHeader("heic"), Classification{Skip: SkipNotMedia}},
+		{"Trip/PXL_20240920_173608869.RAW-01.MP.COVER.jpg", jpeg, Classification{RawPart: "jpeg"}},
+		{"Trip/PXL_20240920_173608869.RAW-02.ORIGINAL.dng", nil, Classification{RawPart: "raw"}},
+		{"Trip/PXL_20240920_173608869.RAW-01.MP.COVER", isoHeader("isom"), Classification{MotionPart: true}},
 	}
 	for _, c := range cases {
 		head := c.head

@@ -107,6 +107,7 @@ Quick start:
 		newLargeFilesCmd(),
 		newLockedFilesCmd(),
 		newMotionVideosCmd(),
+		newRawPairsCmd(),
 		newConfigCmd(),
 	)
 	return root
@@ -146,6 +147,7 @@ func initConfig(cmd *cobra.Command) error {
 	viper.SetDefault("rate-limit", defaultRateLimit)
 	viper.SetDefault("dry-run", false)
 	viper.SetDefault("restore-metadata", defaultRestoreMetadata)
+	viper.SetDefault("raw-pairs", "both")
 
 	// Bind the flags of the command actually being executed so CLI values win
 	// over the config file. Binding must happen here, not when commands are
@@ -416,6 +418,9 @@ and upload in a single step.`,
 			}
 
 			restoreMetadata := viper.GetBool("restore-metadata")
+			if v := viper.GetString("raw-pairs"); v != "both" && v != "jpeg" && v != "raw" {
+				return fmt.Errorf("raw-pairs must be both, jpeg or raw (got %q)", v)
+			}
 			if restoreMetadata {
 				if err := metadata.CheckExiftool(); err != nil {
 					return err
@@ -487,6 +492,9 @@ Press Ctrl-C again to quit immediately.`,
 				}
 			}
 			restoreMetadata := viper.GetBool("restore-metadata")
+			if v := viper.GetString("raw-pairs"); v != "both" && v != "jpeg" && v != "raw" {
+				return fmt.Errorf("raw-pairs must be both, jpeg or raw (got %q)", v)
+			}
 			if restoreMetadata {
 				if err := metadata.CheckExiftool(); err != nil {
 					return err
@@ -550,6 +558,9 @@ func newStatusCmd() *cobra.Command {
 			}
 			if stats.LockedMedia > 0 {
 				fmt.Printf("       🔒 held back %d  (Locked Folder, not uploaded: see 'photo-migrator locked-files')\n", stats.LockedMedia)
+			}
+			if stats.RawPairMedia > 0 {
+				fmt.Printf("       📷 RAW pair  %d  (halves held back by raw-pairs: see 'photo-migrator raw-pairs')\n", stats.RawPairMedia)
 			}
 			if stats.MotionMedia > 0 {
 				fmt.Printf("       🎞 motion    %d  (motion-photo videos, not uploaded: see 'photo-migrator motion-videos')\n", stats.MotionMedia)
@@ -648,6 +659,26 @@ Flags:
 			"  account, then use \"Move to Locked Folder\" in the Google Photos mobile app.",
 		},
 		query: (*store.Store).GetLockedFiles,
+	})
+}
+
+func newRawPairsCmd() *cobra.Command {
+	return newManualFilesCmd(manualReport{
+		use:   "raw-pairs",
+		short: "List Pixel RAW-pair halves held back by the raw-pairs setting",
+		long: `Lists the halves of Pixel RAW shots (PXL_x.RAW-01....jpg and
+PXL_x.RAW-02.ORIGINAL.dng) that were not uploaded because of the raw-pairs
+setting ("jpeg" keeps only the JPEG, "raw" only the DNG). The API cannot link
+the two, so uploading both shows each shot twice.
+
+Flags:
+  --format json    Emit machine-readable JSON instead of a text table
+  --extract <dir>  Extract the held-back files from their source zips into <dir>`,
+		extractHelp: "extract the held-back RAW-pair halves into this directory",
+		empty:       "  ✓ No RAW-pair halves are being held back.",
+		title:       "📷  RAW pairs — %d half(s) held back by the raw-pairs setting",
+		advice:      []string{"  The other half of each shot was uploaded."},
+		query:       (*store.Store).GetRawPairs,
 	})
 }
 
@@ -988,6 +1019,7 @@ func newConfigShowCmd() *cobra.Command {
 				{"log-level", "Log verbosity"},
 				{"dry-run", "Dry-run mode"},
 				{"restore-metadata", "Restore metadata from sidecar before upload"},
+				{"raw-pairs", "Pixel RAW pairs: both | jpeg | raw"},
 			}
 			for _, k := range keys {
 				val := viper.Get(k.key)
@@ -1186,6 +1218,7 @@ func processDirectory(ctx context.Context, dir, sourceZip string, st *store.Stor
 	var (
 		skipped                takeout.Skipped
 		heldLocked, heldMotion int
+		heldRaw                int
 	)
 
 	// The walker gets its own context so it can be released if the pool
@@ -1215,6 +1248,22 @@ func processDirectory(ctx context.Context, dir, sourceZip string, st *store.Stor
 				if held {
 					heldLocked++
 					logger.Debug("held back: Locked Folder file not uploaded", zap.String("file", filepath.Base(j.MediaPath)))
+					return
+				}
+			} else if j.RawPart != "" && rawPairHeld(j.RawPart) {
+				// raw-pairs keeps only one half of each Pixel RAW shot.
+				if pool.DryRun() {
+					heldRaw++
+					return
+				}
+				held, err := st.RegisterHeld(store.StatusRawPair, j.MediaPath, j.SourceZip, j.ZipEntry)
+				if err != nil {
+					logger.Warn("register RAW-pair half", zap.String("path", j.MediaPath), zap.Error(err))
+					return
+				}
+				if held {
+					heldRaw++
+					logger.Debug("held back: RAW-pair half not uploaded", zap.String("file", filepath.Base(j.MediaPath)))
 					return
 				}
 			} else if j.MotionPart {
@@ -1263,15 +1312,28 @@ func processDirectory(ctx context.Context, dir, sourceZip string, st *store.Stor
 	case werr != nil:
 		return fmt.Errorf("walk directory: %w", werr)
 	}
-	logWalkSummary(skipped, heldLocked, heldMotion, sourceZip, dir, logger)
+	logWalkSummary(skipped, heldLocked, heldMotion, heldRaw, sourceZip, dir, logger)
 	return nil
+}
+
+// rawPairHeld reports whether the raw-pairs setting holds back this half
+// ("jpeg" or "raw") of a Pixel RAW pair: "jpeg" keeps the JPEG, "raw" keeps
+// the DNG, "both" (default) keeps both.
+func rawPairHeld(part string) bool {
+	switch viper.GetString("raw-pairs") {
+	case "jpeg":
+		return part == "raw"
+	case "raw":
+		return part == "jpeg"
+	}
+	return false
 }
 
 // logWalkSummary writes one line per kind of file a walked zip (or directory)
 // did not upload, so nothing is left out without a trace: files held back for
 // the first time (per-file lines are at debug level) and files skipped as not
 // media. Takeout's .json metadata files are expected and not reported.
-func logWalkSummary(s takeout.Skipped, heldLocked, heldMotion int, sourceZip, dir string, logger *zap.Logger) {
+func logWalkSummary(s takeout.Skipped, heldLocked, heldMotion, heldRaw int, sourceZip, dir string, logger *zap.Logger) {
 	// In zip mode the logger already carries the zip's name (see processZips).
 	where := zap.Skip()
 	if sourceZip == "" {
@@ -1279,6 +1341,9 @@ func logWalkSummary(s takeout.Skipped, heldLocked, heldMotion int, sourceZip, di
 	}
 	if heldLocked > 0 {
 		logger.Info(fmt.Sprintf("held back %d Locked Folder file(s), not uploaded (list them: photo-migrator locked-files)", heldLocked), where)
+	}
+	if heldRaw > 0 {
+		logger.Info(fmt.Sprintf("held back %d RAW-pair half(s) per raw-pairs, not uploaded (list them: photo-migrator raw-pairs)", heldRaw), where)
 	}
 	if heldMotion > 0 {
 		logger.Info(fmt.Sprintf("held back %d motion-photo video(s), not uploaded (list them: photo-migrator motion-videos)", heldMotion), where)
@@ -1356,6 +1421,8 @@ func addUploadFlags(cmd *cobra.Command) {
 		"max Google Photos API requests per second (default stays under the 75 req/15s quota)")
 	f.Bool("dry-run", false,
 		"log planned uploads without actually uploading")
+	f.String("raw-pairs", "both",
+		"Pixel RAW shots (JPEG + DNG): both | jpeg (upload only the JPEG) | raw (only the DNG)")
 	f.Bool("restore-metadata", defaultRestoreMetadata,
 		"write original date/time and GPS from Takeout sidecar into file metadata before uploading (requires exiftool)")
 }

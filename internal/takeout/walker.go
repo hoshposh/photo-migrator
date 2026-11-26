@@ -66,7 +66,16 @@ type Classification struct {
 	MotionPart bool
 	UploadName string
 	MimeType   string
+	// RawPart is "jpeg" or "raw" for the halves of a Pixel RAW shot
+	// (PXL_x.RAW-01....jpg / PXL_x.RAW-02.ORIGINAL.dng), "" otherwise.
+	RawPart string
 }
+
+// rawJPEGRe and rawDNGRe match the two halves of a Pixel RAW shot.
+var (
+	rawJPEGRe = regexp.MustCompile(`(?i)^PXL_\d{8}_\d+\.RAW-01\..*\.jpe?g$`)
+	rawDNGRe  = regexp.MustCompile(`(?i)^PXL_\d{8}_\d+\.RAW-02\.ORIGINAL\.dng$`)
+)
 
 // Classify decides whether a file (a path on disk or an entry name inside a
 // zip) is migrated and how. head returns the file's first bytes; it is only
@@ -81,6 +90,12 @@ func Classify(name string, head func() []byte) Classification {
 	case ext == ".json":
 		return Classification{Skip: SkipMetadata}
 	case mediaExtensions[ext]:
+		switch {
+		case rawJPEGRe.MatchString(base):
+			return Classification{RawPart: "jpeg"}
+		case rawDNGRe.MatchString(base):
+			return Classification{RawPart: "raw"}
+		}
 		return Classification{}
 	}
 	// Takeout exports some videos under names with no usable extension
@@ -259,6 +274,8 @@ type MigrationJob struct {
 	// Empty means derive both from the file name.
 	UploadName string
 	MimeType   string
+	// RawPart: see Classification.RawPart.
+	RawPart string
 }
 
 // IsZipMode returns true if dir contains at least one .zip file.
@@ -459,6 +476,7 @@ func WalkDirectory(
 			MotionPart:  c.MotionPart,
 			UploadName:  c.UploadName,
 			MimeType:    c.MimeType,
+			RawPart:     c.RawPart,
 		})
 		return nil
 	})

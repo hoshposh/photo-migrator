@@ -326,6 +326,12 @@ Other videos whose names don't end in a known extension (for example `Concert - 
 
 ---
 
+## Pixel RAW + JPEG pairs
+
+Pixel phones save a RAW shot as a JPEG (`PXL_x.RAW-01....jpg`) plus a DNG (`PXL_x.RAW-02.ORIGINAL.dng`). The API cannot link them, so uploading both shows each shot twice. Set `raw-pairs` (config file or `--raw-pairs`) to `jpeg` to upload only the JPEG, or `raw` to upload only the DNG; the default `both` uploads both. Held-back halves get status `raw_pair`, and `photo-migrator raw-pairs` lists them. The setting only affects files not yet uploaded.
+
+---
+
 ## Locked Folder files are held back
 
 Photos and videos from your Google Photos **Locked Folder** are private, and the Google Photos API cannot add files to the destination account's Locked Folder. Uploading them would put them in the main library, visible on every device. So `run` **does not upload them**: they are recorded with status `locked`, they don't stop their zip from completing, and `status` shows how many there are.

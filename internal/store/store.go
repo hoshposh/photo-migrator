@@ -39,6 +39,9 @@ const (
 	// because the API cannot rebuild motion photos (it would appear as a
 	// separate video). Setting it to pending releases it for upload.
 	StatusMotionVideo Status = "motion_video"
+	// StatusRawPair marks the half of a Pixel RAW pair held back by the
+	// raw-pairs setting. Setting it to pending releases it.
+	StatusRawPair Status = "raw_pair"
 )
 
 // Store wraps the SQLite database.
@@ -131,7 +134,7 @@ func (s *Store) SetZipStatus(zipPath string, status Status, errMsg string) error
 func (s *Store) AllZipItemsComplete(zipPath string) (bool, error) {
 	var pending int
 	err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM media_items WHERE source_zip = ? AND status NOT IN ('complete', 'too_large', 'locked', 'motion_video')`,
+		`SELECT COUNT(*) FROM media_items WHERE source_zip = ? AND status NOT IN ('complete', 'too_large', 'locked', 'motion_video', 'raw_pair')`,
 		zipPath,
 	).Scan(&pending)
 	return pending == 0, err
@@ -205,7 +208,7 @@ func (s *Store) RegisterHeld(status Status, sourcePath, sourceZip, zipEntry stri
 	if err := s.db.QueryRow(`SELECT status FROM media_items WHERE source_path = ?`, sourcePath).Scan(&current); err != nil {
 		return false, err
 	}
-	return Status(current) == StatusLocked || Status(current) == StatusMotionVideo, nil
+	return Status(current) == StatusLocked || Status(current) == StatusMotionVideo || Status(current) == StatusRawPair, nil
 }
 
 // IsDone reports whether a media file needs no further upload attempts: it
@@ -232,7 +235,7 @@ func (s *Store) IsDone(sourceZip, zipEntry, sourcePath string) (bool, error) {
 		return false, err
 	}
 	switch Status(status) {
-	case StatusComplete, StatusTooLarge, StatusLocked, StatusMotionVideo:
+	case StatusComplete, StatusTooLarge, StatusLocked, StatusMotionVideo, StatusRawPair:
 		return true, nil
 	}
 	return false, nil
@@ -292,7 +295,7 @@ func (s *Store) GetPendingMedia() ([]MediaItem, error) {
 		        COALESCE(upload_token, ''),
 		        status
 		   FROM media_items
-		  WHERE status NOT IN ('complete', 'too_large', 'locked', 'motion_video')
+		  WHERE status NOT IN ('complete', 'too_large', 'locked', 'motion_video', 'raw_pair')
 		  ORDER BY id ASC`,
 	)
 }
@@ -329,6 +332,11 @@ func (s *Store) GetLockedFiles() ([]ManualItem, error) {
 // GetMotionVideos returns the motion-photo video halves held back from upload.
 func (s *Store) GetMotionVideos() ([]ManualItem, error) {
 	return s.queryManual(` WHERE status = 'motion_video'`)
+}
+
+// GetRawPairs returns the Pixel RAW-pair halves held back by raw-pairs.
+func (s *Store) GetRawPairs() ([]ManualItem, error) {
+	return s.queryManual(` WHERE status = 'raw_pair'`)
 }
 
 func (s *Store) queryManual(where string) ([]ManualItem, error) {
@@ -429,6 +437,7 @@ type Stats struct {
 	TooLargeMedia  int
 	LockedMedia    int
 	MotionMedia    int
+	RawPairMedia   int
 	TotalAlbums    int
 	CompleteAlbums int
 }
@@ -452,9 +461,10 @@ func (s *Store) GetStats() (*Stats, error) {
 		       COALESCE(SUM(CASE WHEN status='error'                            THEN 1 ELSE 0 END), 0),
 		       COALESCE(SUM(CASE WHEN status='too_large'                        THEN 1 ELSE 0 END), 0),
 		       COALESCE(SUM(CASE WHEN status='locked'                           THEN 1 ELSE 0 END), 0),
-		       COALESCE(SUM(CASE WHEN status='motion_video'                     THEN 1 ELSE 0 END), 0)
+		       COALESCE(SUM(CASE WHEN status='motion_video'                     THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN status='raw_pair'                         THEN 1 ELSE 0 END), 0)
 		  FROM media_items`,
-	).Scan(&st.TotalMedia, &st.CompleteMedia, &st.PendingMedia, &st.ErrorMedia, &st.TooLargeMedia, &st.LockedMedia, &st.MotionMedia); err != nil {
+	).Scan(&st.TotalMedia, &st.CompleteMedia, &st.PendingMedia, &st.ErrorMedia, &st.TooLargeMedia, &st.LockedMedia, &st.MotionMedia, &st.RawPairMedia); err != nil {
 		return nil, fmt.Errorf("stats media_items: %w", err)
 	}
 
