@@ -35,3 +35,38 @@ Planned improvements to photo-migrator, highest priority first.
 - What counts as "created by this app" appears to be tied to the OAuth client / Google Cloud project. Items uploaded with credentials from a different project may not be visible. Confirm this before relying on it.
 
 Backing up `migrator.db` remains the only exact protection against re-uploading.
+
+### 3. Add database cleanup sub-commands to the utility
+
+**Problem:** keeping `migrator.db` healthy has so far meant running `sqlite3` by hand: backing it up, finding out why a zip never completes, deleting rows that will never match anything, and getting a zip processed again. Real cases:
+
+- Changing `staging-dir` mid-migration left stale rows that kept zips from completing.
+- The old `--dry-run` bug marked files complete that were never uploaded.
+- macOS `._` files were recorded and could never be retried.
+
+Database migrations fixed those known cases automatically, but the next problem will again need SQL. That is error-prone, and easy to get wrong while a run is using the database.
+
+**Approach:** add a `photo-migrator db` command group:
+
+- `db backup [--to <path>]`: take a consistent copy of the database (SQLite `VACUUM INTO`), safe even while a run is in progress.
+- `db check`: read-only report, per zip, of complete / pending / error / too-large counts, plus anything inconsistent:
+  - rows whose zip entry no longer exists in the zip (read from the zip's file listing, so nothing is extracted);
+  - media files in a zip that the ledger has never seen;
+  - zips marked complete that still have unfinished rows;
+  - rows completed without a real media ID.
+- `db fix`: apply the fixes `db check` suggests, such as deleting orphaned rows or resetting false completions.
+- `db reset-zip <zip>`: put a zip back to pending so the next run checks it again. Files already uploaded are still skipped.
+- `db mark-uploaded <file>`: record that a file `large-files` reports was uploaded by hand through the web interface, so it is no longer listed.
+
+Every command that changes the database should:
+
+- show what it would change and require `--yes` before doing it;
+- take an automatic backup first;
+- refuse to run while a `run` or `upload` is using the same database.
+
+**Done when:** every manual cleanup needed so far can be done with these commands, with no `sqlite3`. That covers diagnosing a zip stuck in `error`, removing stale or junk rows, re-running a zip, backing up, and clearing a manually uploaded file from the `large-files` report.
+
+**Limits:**
+
+- These commands only change the local ledger. They cannot remove or change anything in Google Photos, because the API this tool uses has no delete operation.
+- `db check` can only compare against the zips present in `takeout-dir`. A zip that has been moved or deleted is reported as missing, and its rows are left alone.
