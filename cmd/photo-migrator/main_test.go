@@ -1936,3 +1936,31 @@ func TestProcessDirectory_HoldsBackLivePhotoVideo(t *testing.T) {
 		t.Errorf("GetMotionVideos = %+v, want just IMG_1.MOV", held)
 	}
 }
+
+// Break caught: "scan, then upload" uploading the video half of every Live
+// Photo as a separate video, because `upload` built no pairing index.
+func TestRunUpload_HoldsBackLivePhotoVideo(t *testing.T) {
+	fx := newLivePhotoFixture(t)
+	zipPath := filepath.Join(t.TempDir(), "takeout-001.zip")
+	writeZipEntries(t, zipPath, map[string]string{
+		"Takeout/Google Photos/Photos from 2023/IMG_7297.HEIC": "STILL",
+		"Takeout/Google Photos/Photos from 2023/IMG_7297.MP4":  "LIVE-VIDEO",
+		"Takeout/Google Photos/Photos from 2023/VID_1.mp4":     "STANDALONE",
+	})
+	if err := fx.st.RegisterZip(zipPath); err != nil {
+		t.Fatal(err)
+	}
+	logger := zap.NewNop()
+	pool := pipeline.NewPool(pipeline.Config{Workers: 2, Logger: logger}, fx.client, fx.st)
+	if err := runUpload(context.Background(), t.TempDir(), fx.st, pool, logger); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := fx.status(t, "IMG_7297.MP4"); got != "motion_video" {
+		t.Errorf("IMG_7297.MP4 status = %q, want motion_video", got)
+	}
+	up := fx.uploads()
+	if up["LIVE-VIDEO"] || !up["STILL"] || !up["STANDALONE"] {
+		t.Errorf("uploads = %v, want the still and the standalone video only", up)
+	}
+}

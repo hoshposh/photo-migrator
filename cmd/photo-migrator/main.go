@@ -1083,7 +1083,15 @@ func runUpload(ctx context.Context, stagingDir string, st *store.Store, pool *pi
 		if err := os.MkdirAll(stagingDir, 0o755); err != nil {
 			return fmt.Errorf("create staging dir: %w", err)
 		}
-		return processZips(ctx, pendingZips, stagingDir, st, pool, logger, nil)
+		// No takeout-dir here: index the pending zips themselves plus the ledger.
+		pairs := takeout.NewLivePairs()
+		if err := addZipPairs(ctx, pairs, pendingZips, logger); err != nil {
+			return err
+		}
+		if err := addLedgerPairs(pairs, "", true, st); err != nil {
+			return err
+		}
+		return processZips(ctx, pendingZips, stagingDir, st, pool, logger, pairs)
 	}
 
 	// Dir mode: upload items already registered in the DB.
@@ -1139,12 +1147,8 @@ func buildLivePairs(ctx context.Context, takeoutDir string, zipMode bool, st *st
 		if err != nil {
 			return nil, err
 		}
-		failed, err := pairs.AddZips(ctx, zips)
-		if err != nil {
+		if err := addZipPairs(ctx, pairs, zips, logger); err != nil {
 			return nil, err
-		}
-		for _, z := range failed {
-			logger.Warn("cannot read zip to pair Live Photos; its stills are not considered", zap.String("zip", filepath.Base(z)))
 		}
 	default:
 		// AddDir swallows walk errors, so check the directory exists first.
@@ -1158,9 +1162,30 @@ func buildLivePairs(ctx context.Context, takeoutDir string, zipMode bool, st *st
 	if st == nil {
 		return pairs, nil
 	}
+	if err := addLedgerPairs(pairs, takeoutDir, zipMode, st); err != nil {
+		return nil, err
+	}
+	return pairs, nil
+}
+
+// addZipPairs indexes the stills of zips, warning once per unreadable zip.
+func addZipPairs(ctx context.Context, pairs *takeout.LivePairs, zips []string, logger *zap.Logger) error {
+	failed, err := pairs.AddZips(ctx, zips)
+	if err != nil {
+		return err
+	}
+	for _, z := range failed {
+		logger.Warn("cannot read zip to pair Live Photos; its stills are not considered", zap.String("zip", filepath.Base(z)))
+	}
+	return nil
+}
+
+// addLedgerPairs indexes every file the ledger has seen: by zip entry when it
+// has one, else (dir mode, takeoutDir set) by path relative to takeoutDir.
+func addLedgerPairs(pairs *takeout.LivePairs, takeoutDir string, zipMode bool, st *store.Store) error {
 	entries, err := st.ListRegisteredEntries()
 	if err != nil {
-		return nil, fmt.Errorf("list ledger entries: %w", err)
+		return fmt.Errorf("list ledger entries: %w", err)
 	}
 	for _, e := range entries {
 		switch {
@@ -1174,7 +1199,7 @@ func buildLivePairs(ctx context.Context, takeoutDir string, zipMode bool, st *st
 			pairs.Add(filepath.ToSlash(rel))
 		}
 	}
-	return pairs, nil
+	return nil
 }
 
 // processZips extracts and uploads each zip sequentially, cleaning up staging
