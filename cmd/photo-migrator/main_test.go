@@ -754,3 +754,33 @@ func TestProcessZips_StagingDirChangeDoesNotReupload(t *testing.T) {
 		t.Errorf("media rows: total=%d complete=%d, want 1 and 1", stats.TotalMedia, stats.CompleteMedia)
 	}
 }
+
+// Break caught: zap's production sampling silently dropping repeated per-file
+// log lines (it keeps ~100 identical messages per second), which hides
+// uploads and errors from the user's log during fast bursts.
+func TestBuildLogger_DoesNotDropRepeatedLines(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan []byte)
+	go func() {
+		b, _ := io.ReadAll(r)
+		done <- b
+	}()
+	orig := os.Stderr
+	os.Stderr = w
+	viper.Reset()
+	logger := buildLogger()
+	for i := 0; i < 250; i++ {
+		logger.Info("✓ uploaded", zap.Int("i", i))
+	}
+	_ = logger.Sync()
+	os.Stderr = orig
+	_ = w.Close()
+	out := <-done
+
+	if n := bytes.Count(out, []byte(`"msg":"✓ uploaded"`)); n != 250 {
+		t.Errorf("logged %d of 250 lines; repeated messages are being sampled away", n)
+	}
+}

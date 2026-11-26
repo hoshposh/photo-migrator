@@ -1129,6 +1129,9 @@ func buildLogger() *zap.Logger {
 	}
 	cfg := zap.NewProductionConfig()
 	cfg.Level = zap.NewAtomicLevelAt(level)
+	// The production default samples repeated messages (~100/s each), which
+	// silently drops per-file lines. Every upload and error must be logged.
+	cfg.Sampling = nil
 	cfg.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
 	logger, _ := cfg.Build()
 	return logger
