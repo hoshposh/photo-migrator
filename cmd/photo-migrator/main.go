@@ -1098,20 +1098,22 @@ func processZips(ctx context.Context, zips []string, stagingDir string, st *stor
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		logger.Info("processing zip",
+		// Every line logged while this zip is processed carries its name.
+		zipLog := logger.With(zap.String("zip", filepath.Base(zipPath)))
+		zipLog.Info("processing zip",
 			zap.Int("n", i+1), zap.Int("total", len(zips)),
-			zap.String("zip", zipPath),
+			zap.String("path", zipPath),
 		)
 
 		if err := setZipStatus(zipPath, store.StatusExtracting, ""); err != nil {
 			return err
 		}
-		extractRoot, err := takeout.ExtractZip(ctx, zipPath, stagingDir, logger)
+		extractRoot, err := takeout.ExtractZip(ctx, zipPath, stagingDir, zipLog)
 		if err != nil {
 			if ctx.Err() != nil {
-				return interrupted(ctx, zipPath, setZipStatus, logger)
+				return interrupted(ctx, zipPath, setZipStatus, zipLog)
 			}
-			logger.Error("extraction failed", zap.String("zip", zipPath), zap.Error(err))
+			zipLog.Error("extraction failed", zap.Error(err))
 			_ = setZipStatus(zipPath, store.StatusError, err.Error())
 			continue // try next zip
 		}
@@ -1120,16 +1122,16 @@ func processZips(ctx context.Context, zips []string, stagingDir string, st *stor
 			return err
 		}
 
-		uploadErr := processDirectory(ctx, extractRoot, zipPath, st, pool, logger)
+		uploadErr := processDirectory(ctx, extractRoot, zipPath, st, pool, zipLog)
 
 		// Remove staging files regardless of success/error — completed items
 		// are tracked in the DB; failures will be re-extracted on the next run.
 		if err := os.RemoveAll(extractRoot); err != nil {
-			logger.Warn("cleanup staging", zap.String("dir", extractRoot), zap.Error(err))
+			zipLog.Warn("cleanup staging", zap.String("dir", extractRoot), zap.Error(err))
 		}
 
 		if ctx.Err() != nil {
-			return interrupted(ctx, zipPath, setZipStatus, logger)
+			return interrupted(ctx, zipPath, setZipStatus, zipLog)
 		}
 		if errors.Is(uploadErr, photos.ErrAuthFailed) {
 			// Not this zip's fault: leave it pending and stop the whole run.
@@ -1137,12 +1139,12 @@ func processZips(ctx context.Context, zips []string, stagingDir string, st *stor
 			return uploadErr
 		}
 		if uploadErr != nil {
-			logger.Error("upload phase failed", zap.String("zip", zipPath), zap.Error(uploadErr))
+			zipLog.Error("upload phase failed", zap.Error(uploadErr))
 			_ = setZipStatus(zipPath, store.StatusError, uploadErr.Error())
 		}
 
 		if pool.DryRun() {
-			logger.Info("dry-run: zip walked, status unchanged", zap.String("zip", zipPath))
+			zipLog.Info("dry-run: zip walked, status unchanged")
 			continue
 		}
 
@@ -1155,9 +1157,9 @@ func processZips(ctx context.Context, zips []string, stagingDir string, st *stor
 			if err := st.SetZipStatus(zipPath, store.StatusComplete, ""); err != nil {
 				return err
 			}
-			logger.Info("zip complete ✓", zap.String("zip", zipPath))
+			zipLog.Info("zip complete ✓")
 		} else {
-			logger.Warn("zip has errors — will retry on next run", zap.String("zip", zipPath))
+			zipLog.Warn("zip has errors — will retry on next run")
 			_ = st.SetZipStatus(zipPath, store.StatusError, "some items failed")
 		}
 	}
@@ -1166,10 +1168,11 @@ func processZips(ctx context.Context, zips []string, stagingDir string, st *stor
 
 // interrupted handles a Ctrl+C during a zip: the zip goes back to pending
 // with no error (it resumes on the next run; finished uploads are skipped)
-// and ctx.Err() is returned so the command exits as interrupted.
+// and ctx.Err() is returned so the command exits as interrupted. logger
+// already carries the zip's name.
 func interrupted(ctx context.Context, zipPath string, setZipStatus func(string, store.Status, string) error, logger *zap.Logger) error {
 	_ = setZipStatus(zipPath, store.StatusPending, "")
-	logger.Info("interrupted — zip will resume on the next run", zap.String("zip", zipPath))
+	logger.Info("interrupted — zip will resume on the next run")
 	return ctx.Err()
 }
 
@@ -1267,7 +1270,8 @@ func processDirectory(ctx context.Context, dir, sourceZip string, st *store.Stor
 // the first time (per-file lines are at debug level) and files skipped as not
 // media. Takeout's .json metadata files are expected and not reported.
 func logWalkSummary(s takeout.Skipped, heldLocked, heldMotion int, sourceZip, dir string, logger *zap.Logger) {
-	where := zap.String("zip", filepath.Base(sourceZip))
+	// In zip mode the logger already carries the zip's name (see processZips).
+	where := zap.Skip()
 	if sourceZip == "" {
 		where = zap.String("dir", dir)
 	}

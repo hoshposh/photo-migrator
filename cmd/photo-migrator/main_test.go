@@ -1221,3 +1221,60 @@ func TestProcessZips_SummarisesHeldBackFilesPerZip(t *testing.T) {
 		}
 	}
 }
+
+// Break caught: log lines (uploads, failures, held-back files, summaries)
+// that don't say which zip they belong to, or that carry the "zip" key twice.
+func TestProcessZips_EveryLineNamesItsZip(t *testing.T) {
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/uploads"):
+			_, _ = io.WriteString(w, "tok")
+		case strings.HasSuffix(r.URL.Path, "/mediaItems:batchCreate"):
+			_, _ = io.WriteString(w, `{"newMediaItemResults":[{"uploadToken":"tok","status":{},"mediaItem":{"id":"m"}}]}`)
+		case strings.HasSuffix(r.URL.Path, "/albums"):
+			_, _ = io.WriteString(w, `{"id":"album-1","title":"Trip"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer fake.Close()
+	target, _ := url.Parse(fake.URL)
+	client := photos.New(&http.Client{Transport: rewriteTransport{target}})
+
+	zipPath := filepath.Join(t.TempDir(), "takeout-001.zip")
+	writeZipEntries(t, zipPath, map[string]string{
+		"Takeout/Google Photos/Trip/a.jpg":                "\xff\xd8\xff\xe0",
+		"Takeout/Google Photos/Photos from 2022/PXL_a.MP": "\x00\x00\x00\x20ftypisom\x00\x00\x02\x00",
+		"Takeout/Google Photos/Trip/print-order.pdf":      "%PDF-1.4",
+	})
+	st, err := store.Open(filepath.Join(t.TempDir(), "m.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	if err := st.RegisterZip(zipPath); err != nil {
+		t.Fatal(err)
+	}
+	core, logs := observer.New(zap.DebugLevel)
+	logger := zap.New(core)
+	pool := pipeline.NewPool(pipeline.Config{Workers: 2, Logger: logger}, client, st)
+
+	if err := processZips(context.Background(), []string{zipPath}, t.TempDir(), st, pool, logger); err != nil {
+		t.Fatal(err)
+	}
+
+	if logs.Len() < 6 {
+		t.Fatalf("only %d log lines; expected uploads, album, held-back, skipped and progress lines", logs.Len())
+	}
+	for _, e := range logs.All() {
+		n := 0
+		for _, f := range e.Context {
+			if f.Key == "zip" {
+				n++
+			}
+		}
+		if n != 1 || e.ContextMap()["zip"] != "takeout-001.zip" {
+			t.Errorf("%q: zip fields = %d, zip = %v; want exactly one zip=\"takeout-001.zip\"", e.Message, n, e.ContextMap()["zip"])
+		}
+	}
+}

@@ -347,7 +347,7 @@ func ExtractZip(ctx context.Context, zipPath, stagingDir string, logger *zap.Log
 		}
 	}
 
-	logger.Info("extracted zip", zap.String("zip", filepath.Base(zipPath)), zap.String("dest", destRoot))
+	logger.Info("extracted zip", zap.String("dest", destRoot)) // the caller's logger names the zip
 	return destRoot, nil
 }
 

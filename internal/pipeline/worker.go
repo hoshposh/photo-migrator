@@ -97,10 +97,14 @@ func (p *Pool) Run(ctx context.Context, jobs <-chan Job) error {
 }
 
 func (p *Pool) process(ctx context.Context, job Job, stop func(error)) {
-	log := p.cfg.Logger.With(
+	fields := []zap.Field{
 		zap.String("file", filepath.Base(job.MediaPath)),
 		zap.String("album", job.AlbumName),
-	)
+	}
+	if job.SourceZip != "" {
+		fields = append(fields, zap.String("zip", filepath.Base(job.SourceZip)))
+	}
+	log := p.cfg.Logger.With(fields...)
 
 	// Interrupted before this job started: leave it pending for the next run.
 	if ctx.Err() != nil {
@@ -114,7 +118,7 @@ func (p *Pool) process(ctx context.Context, job Job, stop func(error)) {
 	}
 
 	// Resolve (or create) the destination album.
-	albumID, err := p.resolveAlbum(ctx, job.AlbumName)
+	albumID, err := p.resolveAlbum(ctx, job.AlbumName, log)
 	if err != nil {
 		if ctx.Err() != nil {
 			return // interrupted, not a failure: leave pending
@@ -178,7 +182,7 @@ func (p *Pool) process(ctx context.Context, job Job, stop func(error)) {
 //
 // singleflight ensures that concurrent workers requesting the same album name
 // coalesce into a single CreateAlbum call, preventing duplicate albums.
-func (p *Pool) resolveAlbum(ctx context.Context, albumName string) (string, error) {
+func (p *Pool) resolveAlbum(ctx context.Context, albumName string, log *zap.Logger) (string, error) {
 	if albumName == "" {
 		return "", nil // library root — no album needed
 	}
@@ -212,7 +216,7 @@ func (p *Pool) resolveAlbum(ctx context.Context, albumName string) (string, erro
 			return "", err
 		}
 
-		p.cfg.Logger.Info("created album", zap.String("name", albumName), zap.String("id", album.ID))
+		log.Info("created album", zap.String("name", albumName), zap.String("id", album.ID))
 		return album.ID, nil
 	})
 	if err != nil {
