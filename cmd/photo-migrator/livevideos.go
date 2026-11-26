@@ -3,8 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -121,6 +124,16 @@ func runUploadedVideos(ctx context.Context, st *store.Store, newClient func() (*
 		return fmt.Errorf("--format must be text, json or html, got %q", opts.Format)
 	}
 	zipMode := false
+	if opts.TakeoutDir != "" {
+		// The zips are often deleted while the checklist is still being worked
+		// through; the ledger alone is enough then.
+		if _, err := os.Stat(opts.TakeoutDir); errors.Is(err, fs.ErrNotExist) {
+			logger.Warn("takeout-dir not found; using the database only", zap.String("path", opts.TakeoutDir))
+			opts.TakeoutDir = ""
+		} else if err != nil {
+			return fmt.Errorf("takeout-dir: %w", err)
+		}
+	}
 	if opts.TakeoutDir != "" {
 		var err error
 		if zipMode, err = takeout.IsZipMode(opts.TakeoutDir); err != nil {

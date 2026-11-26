@@ -711,11 +711,11 @@ Reading from Google needs the photoslibrary.readonly.appcreateddata scope (see
 wrong-dates).
 
 Flags:
-  --format json    Emit machine-readable JSON instead of a text table
-  --format html    With --uploaded only: a checklist web page with a link to each video
-  --extract <dir>  Extract the videos from their source zips into <dir>
-  --uploaded       List the Live Photo videos already uploaded, not the held-back ones
-  --takeout-dir <dir>  with --uploaded: where the Takeout zips or folder are (or set takeout-dir in the config)`,
+  --format json        Emit machine-readable JSON instead of a text table
+  --format html        With --uploaded only: a checklist web page with a link to each video
+  --extract <dir>      Extract the videos from their source zips into <dir>
+  --uploaded           List the Live Photo videos already uploaded, not the held-back ones
+  --takeout-dir <dir>  With --uploaded only: where the Takeout zips or folder are (or set takeout-dir in the config)`,
 		extractHelp: "extract the motion-photo videos from their source zips into this directory",
 		empty:       "  ✓ No motion-photo videos are being held back.",
 		title:       "🎞  Motion photos — %d video part(s) held back (the still images were uploaded)",
@@ -749,7 +749,7 @@ Flags:
 		}()
 
 		ctx, stop := withSignals(cmd.Context(), func() {
-			fmt.Fprintln(os.Stderr, "\nStopping: dates already read are saved. Press Ctrl+C again to quit immediately.")
+			fmt.Fprintln(os.Stderr, "\nStopping: links already read are saved. Press Ctrl+C again to quit immediately.")
 		})
 		defer stop()
 

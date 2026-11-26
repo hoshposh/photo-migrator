@@ -5,11 +5,14 @@ import "html/template"
 // checklistPage is what the shared shell renders around a page's own table.
 type checklistPage struct {
 	Title, Heading string
-	Intro          template.HTML // one paragraph of instructions; may use <b> and entities
-	StorageKey     string        // localStorage key for the ticks
-	Generated      string
-	Notes          []string // lines under the table (counts, hints)
-	Rows           any      // passed to the page's "table" template
+	// Intro is one paragraph of instructions; it may use <b> and entities. It is
+	// trusted static markup only: never put file or album names or other data in
+	// it, because they would not be escaped.
+	Intro      template.HTML
+	StorageKey string // localStorage key for the ticks
+	Generated  string
+	Notes      []string // lines under the table (counts, hints)
+	Rows       any      // passed to the page's "table" template
 }
 
 // newChecklistTemplate returns the shared shell (CSS, counter, tick JS) with

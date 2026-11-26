@@ -140,14 +140,16 @@ Every command that changes the database should:
 - Files already uploaded are not removed (the API cannot delete). The setting only affects files not yet uploaded, so it is worth deciding before a migration starts.
 - Holding back the DNG means the destination keeps only the processed JPEG of those shots, unless the held-back files are uploaded later by hand.
 
-### 7. Uploaded files show the upload date instead of the date tak**Progress** (design: [wrong-dates report](docs/superpowers/specs/2026-11-26-wrong-dates-report-design.md), [sidecar names](docs/superpowers/specs/2026-11-26-sidecar-naming-design.md)):
+### 7. Uploaded files show the upload date instead of the date taken
+
+**Progress** (design: [wrong-dates report](docs/superpowers/specs/2026-11-26-wrong-dates-report-design.md), [sidecar names](docs/superpowers/specs/2026-11-26-sidecar-naming-design.md)):
 
 - [x] `wrong-dates` report, with `--recheck` after fixing dates by hand
 - [x] HTML checklist (`--format html`) with a link to each photo
 - [x] Sidecar lookup finds edited copies, Live Photo videos, numbered duplicates and cut-short names (left about 20 of 2,168 such photos without a sidecar on one real Takeout)
 - [ ] Record the result of `restore-metadata` per file in the ledger (`written`, `no_sidecar`, `no_date`, `failed`)
 - [ ] Write the date tags Google Photos reads for formats that need them (videos, PNG)
-- [ ] Log one summary line per zip ("no date written for N files")yet.
+- [ ] Log one summary line per zip ("no date written for N files")
 
 **Problem:** some photos arrive in the destination account dated the day this tool uploaded them, not the day they were taken, so they appear in the wrong place in the timeline. `restore-metadata` already writes the sidecar's date into each file with exiftool before upload, so these are files where that did not work. Likely causes, not yet confirmed:
 

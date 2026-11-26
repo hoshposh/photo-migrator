@@ -110,6 +110,25 @@ func TestUploadedVideos_NoTakeoutDir(t *testing.T) {
 	}
 }
 
+// Break caught: a takeout-dir left in the config after the zips and their
+// folder were deleted making the cleanup page fail instead of using the
+// database alone.
+func TestUploadedVideos_MissingTakeoutDir(t *testing.T) {
+	f := newWDFixture(t)
+	f.upload("takeout-001.zip", lvTrip+"IMG_1.HEIC", "Trip", "m-still")
+	f.upload("takeout-002.zip", lvTrip+"IMG_1.MP4", "Trip", "m-live")
+	f.google["m-live"] = wdGoogle
+
+	gone := filepath.Join(f.dir, "deleted-takeout")
+	out, _, err := f.lvRun(context.Background(), uploadedVideosOpts{TakeoutDir: gone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "1 video(s) to remove by hand") || !strings.Contains(out, "IMG_1.MP4") {
+		t.Errorf("video not listed:\n%s", out)
+	}
+}
+
 // Break caught: directory mode (no zips, files compared by path relative to
 // the takeout directory) not finding its videos.
 func TestUploadedVideos_DirMode(t *testing.T) {
