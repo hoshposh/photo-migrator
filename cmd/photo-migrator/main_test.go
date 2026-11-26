@@ -1176,3 +1176,48 @@ func TestProcessZips_LogsSkippedFilesPerZip(t *testing.T) {
 		t.Errorf("log fields = %v, want types=\".pdf ×2\" zip=\"takeout-001.zip\"", f)
 	}
 }
+
+// Break caught: one info line per held-back file (~1,300 in a real Takeout)
+// drowning out upload progress, instead of one summary line per zip.
+func TestProcessZips_SummarisesHeldBackFilesPerZip(t *testing.T) {
+	video := "\x00\x00\x00\x20ftypisom\x00\x00\x02\x00"
+	zipPath := filepath.Join(t.TempDir(), "takeout-001.zip")
+	writeZipEntries(t, zipPath, map[string]string{
+		"Takeout/Google Photos/Photos from 2022/PXL_a.MP":               video,
+		"Takeout/Google Photos/Photos from 2022/PXL_b.MP":               video,
+		"Takeout/Google Photos/Locked Folder/PXL_c.RAW-01.MP.COVER":     video,
+		"Takeout/Google Photos/Locked Folder/PXL_c.RAW-01.MP.COVER.jpg": "\xff\xd8\xff\xe0",
+	})
+	st, err := store.Open(filepath.Join(t.TempDir(), "m.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	if err := st.RegisterZip(zipPath); err != nil {
+		t.Fatal(err)
+	}
+	core, logs := observer.New(zap.InfoLevel)
+	logger := zap.New(core)
+	pool := pipeline.NewPool(pipeline.Config{Workers: 1, RateLimit: 1000, Logger: logger}, nil, st)
+
+	if err := processZips(context.Background(), []string{zipPath}, t.TempDir(), st, pool, logger); err != nil {
+		t.Fatal(err)
+	}
+
+	if n := logs.FilterMessageSnippet("held back:").Len(); n != 0 { // per-file lines; summaries read "held back N ..."
+		t.Errorf("%d per-file held-back lines at info level, want 0 (debug only)", n)
+	}
+	for snippet, wantZip := range map[string]string{
+		"held back 2 motion-photo video(s)": "takeout-001.zip",
+		"held back 2 Locked Folder file(s)": "takeout-001.zip",
+	} {
+		found := logs.FilterMessageSnippet(snippet).All()
+		if len(found) != 1 {
+			t.Errorf("want 1 info line containing %q, got %d: %v", snippet, len(found), logs.All())
+			continue
+		}
+		if z := found[0].ContextMap()["zip"]; z != wantZip {
+			t.Errorf("%q logged with zip=%v, want %s", snippet, z, wantZip)
+		}
+	}
+}

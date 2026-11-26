@@ -1179,7 +1179,11 @@ func interrupted(ctx context.Context, zipPath string, setZipStatus func(string, 
 func processDirectory(ctx context.Context, dir, sourceZip string, st *store.Store, pool *pipeline.Pool, logger *zap.Logger) error {
 	jobs := make(chan pipeline.Job, 200)
 	walkErr := make(chan error, 1)
-	var skipped takeout.Skipped // written by the walker before it sends on walkErr
+	// Written by the walker goroutine before it sends on walkErr.
+	var (
+		skipped                takeout.Skipped
+		heldLocked, heldMotion int
+	)
 
 	// The walker gets its own context so it can be released if the pool
 	// stops early (fatal error) and nothing is left to drain the channel.
@@ -1196,7 +1200,8 @@ func processDirectory(ctx context.Context, dir, sourceZip string, st *store.Stor
 			// has approved them (status set back to pending).
 			if j.Locked {
 				if pool.DryRun() {
-					logger.Info("dry-run: Locked Folder file would be held back", zap.String("file", filepath.Base(j.MediaPath)))
+					heldLocked++
+					logger.Debug("dry-run: Locked Folder file would be held back", zap.String("file", filepath.Base(j.MediaPath)))
 					return
 				}
 				held, err := st.RegisterHeld(store.StatusLocked, j.MediaPath, j.SourceZip, j.ZipEntry)
@@ -1205,15 +1210,16 @@ func processDirectory(ctx context.Context, dir, sourceZip string, st *store.Stor
 					return // never upload a Locked Folder file we could not record
 				}
 				if held {
-					logger.Info("held back: Locked Folder file not uploaded (see 'photo-migrator locked-files')",
-						zap.String("file", filepath.Base(j.MediaPath)))
+					heldLocked++
+					logger.Debug("held back: Locked Folder file not uploaded", zap.String("file", filepath.Base(j.MediaPath)))
 					return
 				}
 			} else if j.MotionPart {
 				// The API cannot rebuild a motion photo: its video half would
 				// become a separate video. Hold it back unless released.
 				if pool.DryRun() {
-					logger.Info("dry-run: motion-photo video would be held back", zap.String("file", filepath.Base(j.MediaPath)))
+					heldMotion++
+					logger.Debug("dry-run: motion-photo video would be held back", zap.String("file", filepath.Base(j.MediaPath)))
 					return
 				}
 				held, err := st.RegisterHeld(store.StatusMotionVideo, j.MediaPath, j.SourceZip, j.ZipEntry)
@@ -1222,8 +1228,8 @@ func processDirectory(ctx context.Context, dir, sourceZip string, st *store.Stor
 					return
 				}
 				if held {
-					logger.Info("held back: motion-photo video not uploaded (see 'photo-migrator motion-videos')",
-						zap.String("file", filepath.Base(j.MediaPath)))
+					heldMotion++
+					logger.Debug("held back: motion-photo video not uploaded", zap.String("file", filepath.Base(j.MediaPath)))
 					return
 				}
 			} else if !pool.DryRun() {
@@ -1254,17 +1260,24 @@ func processDirectory(ctx context.Context, dir, sourceZip string, st *store.Stor
 	case werr != nil:
 		return fmt.Errorf("walk directory: %w", werr)
 	}
-	logSkipped(skipped, sourceZip, dir, logger)
+	logWalkSummary(skipped, heldLocked, heldMotion, sourceZip, dir, logger)
 	return nil
 }
 
-// logSkipped writes one summary line per walked zip (or directory) for files
-// that were not migrated, so nothing is skipped without a trace. Takeout's
-// .json metadata files are expected and not reported.
-func logSkipped(s takeout.Skipped, sourceZip, dir string, logger *zap.Logger) {
+// logWalkSummary writes one line per kind of file a walked zip (or directory)
+// did not upload, so nothing is left out without a trace: files held back for
+// the first time (per-file lines are at debug level) and files skipped as not
+// media. Takeout's .json metadata files are expected and not reported.
+func logWalkSummary(s takeout.Skipped, heldLocked, heldMotion int, sourceZip, dir string, logger *zap.Logger) {
 	where := zap.String("zip", filepath.Base(sourceZip))
 	if sourceZip == "" {
 		where = zap.String("dir", dir)
+	}
+	if heldLocked > 0 {
+		logger.Info(fmt.Sprintf("held back %d Locked Folder file(s), not uploaded (list them: photo-migrator locked-files)", heldLocked), where)
+	}
+	if heldMotion > 0 {
+		logger.Info(fmt.Sprintf("held back %d motion-photo video(s), not uploaded (list them: photo-migrator motion-videos)", heldMotion), where)
 	}
 	if n := s.Count(takeout.SkipNotMedia); n > 0 {
 		logger.Warn(fmt.Sprintf("skipped %d file(s) not recognised as photos or videos (list them: photo-migrator scan --skipped)", n),
