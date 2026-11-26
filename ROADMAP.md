@@ -91,3 +91,25 @@ Every command that changes the database should:
 - Approving uploads a file into the main library. Making it private again means using "Move to Locked Folder" in the Google Photos mobile app. The session should say so before each approval.
 - The tool cannot control what an external viewer or desktop thumbnailer caches. Image viewers and file managers may keep thumbnails (for example in `~/.cache/thumbnails`) after the extracted file has been deleted.
 - Motion photos are exported as a still image plus a separate video file. Both parts should be approved together, which depends on the tool handling motion-photo video parts at all; today they are skipped as unrecognised files.
+
+### 5. Resumable uploads for large files
+
+**Problem:** files are uploaded in one request (`X-Goog-Upload-Protocol: raw`). If that request is cut off, the whole file starts again from zero: by a second Ctrl+C, a network drop, or the process ending. Takeout exports often contain videos of 0.5–2 GB, which take 5–10 minutes each on a typical home connection. So:
+
+- Ctrl+C has to wait for them to finish, or lose all the progress made.
+- A network error near the end of a large upload repeats the whole upload.
+
+**Approach:** use Google's resumable upload protocol for files above a size threshold (for example 50 MB):
+
+- Start a resumable session (`X-Goog-Upload-Protocol: resumable`, `X-Goog-Upload-Command: start`), then send the file in chunks (`upload` / `upload, finalize` with `X-Goog-Upload-Offset`).
+- Record the session URL and the confirmed offset in the ledger (new columns on `media_items`, via a migration). After an interruption, the next run asks Google for the received size (`X-Goog-Upload-Command: query`) and continues from there. If the session has expired, start again.
+- With progress kept between runs, the first Ctrl+C can stop large uploads at the end of the current chunk instead of waiting for the whole file. The stop report then says "will resume at 312 / 456 MB".
+- Retry a failed chunk instead of the whole file. The rate limit applies per chunk request.
+
+**Done when:**
+
+- Interrupting a run during a large upload (one Ctrl+C) stops within one chunk's time, and the next run finishes that file from where it stopped.
+- A simulated network drop mid-file resends only the remaining chunks.
+- Files below the threshold keep the current single-request upload.
+
+**Limits:** Google keeps resumable sessions only for a limited time (check the current documentation for how long), so a migration paused for longer restarts those files from zero. Chunked uploads make more requests per large file, which `rate-limit` counts.
