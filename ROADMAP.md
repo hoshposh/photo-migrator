@@ -116,7 +116,11 @@ Every command that changes the database should:
 
 ### 6. Pixel RAW + JPEG pairs appear as two photos
 
-**Status:** built: the `raw-pairs` setting (`both` | `jpeg` | `raw`), status `raw_pair`, and the `raw-pairs` report. Pair counts in `scan --skipped` are not done yet.
+**Progress:**
+
+- [x] `raw-pairs` setting (`both` | `jpeg` | `raw`) and status `raw_pair`
+- [x] `raw-pairs` report (with `--extract`)
+- [ ] Pair counts in `scan --skipped`
 
 **Problem:** Pixel phones save a RAW shot as a JPEG (`PXL_x.RAW-01.MP.COVER.jpg`, which is also a motion photo with its video in `PXL_x.RAW-01.MP.COVER`) and a DNG (`PXL_x.RAW-02.ORIGINAL.dng`). On the phone, Google Photos shows the pair as one photo with a RAW badge. Through the Library API there is no way to link them, so each pair arrives as **two separate items**, the JPEG and the RAW, and the shot appears twice in the library. One real Takeout had 786 such pairs.
 
@@ -136,9 +140,14 @@ Every command that changes the database should:
 - Files already uploaded are not removed (the API cannot delete). The setting only affects files not yet uploaded, so it is worth deciding before a migration starts.
 - Holding back the DNG means the destination keeps only the processed JPEG of those shots, unless the held-back files are uploaded later by hand.
 
-### 7. Uploaded files show the upload date instead of the date taken
+### 7. Uploaded files show the upload date instead of the date tak**Progress** (design: [wrong-dates report](docs/superpowers/specs/2026-11-26-wrong-dates-report-design.md), [sidecar names](docs/superpowers/specs/2026-11-26-sidecar-naming-design.md)):
 
-**Status:** the `wrong-dates` report is built, including `--recheck`, which asks Google again about the photos listed as wrong after they are fixed by hand. The first known cause is fixed: the sidecar lookup now finds the sidecars Takeout names differently (edited copies, Live Photo / motion videos, numbered `(1)` duplicates, names cut short), and stops giving a file its numbered duplicate's sidecar; on one real Takeout this left about 20 of 2,168 such photos without a sidecar. Other causes (exiftool failures, formats whose date Google doesn't read) are not investigated yet.
+- [x] `wrong-dates` report, with `--recheck` after fixing dates by hand
+- [x] HTML checklist (`--format html`) with a link to each photo
+- [x] Sidecar lookup finds edited copies, Live Photo videos, numbered duplicates and cut-short names (left about 20 of 2,168 such photos without a sidecar on one real Takeout)
+- [ ] Record the result of `restore-metadata` per file in the ledger (`written`, `no_sidecar`, `no_date`, `failed`)
+- [ ] Write the date tags Google Photos reads for formats that need them (videos, PNG)
+- [ ] Log one summary line per zip ("no date written for N files")yet.
 
 **Problem:** some photos arrive in the destination account dated the day this tool uploaded them, not the day they were taken, so they appear in the wrong place in the timeline. `restore-metadata` already writes the sidecar's date into each file with exiftool before upload, so these are files where that did not work. Likely causes, not yet confirmed:
 
@@ -186,6 +195,12 @@ The Library API cannot change a media item's date after upload: `batchCreate` ta
 - Uploading only the edited version loses the unedited original from the destination, unless the held-back files are uploaded later by hand.
 
 ### 9. iPhone Live Photo videos are uploaded as separate videos
+
+**Progress** (design: [Live Photo videos](docs/superpowers/specs/2026-11-26-live-photo-videos-design.md)):
+
+- [x] Recognise a Live Photo video half by its still, across zips
+- [ ] Hold them back during `run` (status `motion_video`) and count them in `scan --skipped`
+- [ ] `motion-videos --uploaded --format html` cleanup page for the ones already uploaded
 
 **Problem:** Takeout exports an iPhone Live Photo as a still image (`IMG_7297.HEIC`) plus a short video with the same name (`IMG_7297.MP4`); older Pixel motion photos come out the same way (`MVIMG_x.jpg` + `MVIMG_x.MP4`). The tool already holds back Pixel motion-photo video halves (`….MP`, `….MP.COVER`, status `motion_video`), but it does not recognise these: each video is uploaded as a separate 1–3 second video next to its still. One real Takeout had 818 such videos. The Library API cannot rebuild a Live Photo or motion photo.
 
