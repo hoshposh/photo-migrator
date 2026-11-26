@@ -318,6 +318,9 @@ photo's date after upload, so these can only be fixed by hand, but the
 
 # Machine-readable JSON
 ./photo-migrator wrong-dates --takeout-dir /path/to/takeout-zips/ --format json
+
+# After fixing some dates by hand: ask Google again about the listed photos
+./photo-migrator wrong-dates --recheck
 ```
 
 For every uploaded file it reads the date taken from the file's Takeout
@@ -335,6 +338,7 @@ so later runs only look at new uploads and need neither the zips nor Google.
 
   Fix each in Google Photos: open the photo → ⋮ → Edit date & time.
   Dates are shown in UTC.
+  After fixing some, run: photo-migrator wrong-dates --recheck
   Not judged: 41 without a sidecar date, 3 already in your library before this tool, or deleted.
 ```
 
@@ -344,7 +348,9 @@ photos are counted as "already in your library before this tool, or deleted"
 and not judged.
 
 To fix a photo, find it in Google Photos, open it, and choose
-**⋮ → Edit date & time**.
+**⋮ → Edit date & time**. Then run `wrong-dates --recheck`: it asks Google
+again about the photos that were listed (and only those, plus any not yet
+checked), so the ones you fixed drop off the list.
 
 > [!NOTE]
 > Reading dates from Google needs the `photoslibrary.readonly.appcreateddata`
@@ -449,6 +455,7 @@ photo-migrator large-files                     # report files too large for the 
 photo-migrator large-files --format json       # machine-readable JSON report
 photo-migrator large-files --extract <dir>     # re-extract oversized files for manual upload
 photo-migrator wrong-dates --takeout-dir <dir> # list uploaded photos whose Google date is not the date taken
+photo-migrator wrong-dates --recheck           # ask Google again about the listed photos
 photo-migrator locked-files                    # list Locked Folder files held back from upload
 photo-migrator locked-files --extract <dir>    # extract them to handle by hand
 photo-migrator motion-videos                   # list motion-photo video parts held back from upload

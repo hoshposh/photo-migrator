@@ -35,6 +35,7 @@ const (
 type wrongDatesOpts struct {
 	TakeoutDir string
 	Format     string // "text" | "json"
+	Recheck    bool   // ask Google again about photos currently listed as wrong
 }
 
 // dateReport is the verdict on every uploaded photo, counted per media ID.
@@ -163,7 +164,13 @@ func runWrongDates(ctx context.Context, st *store.Store, newClient func() (*phot
 	if err := fillTakenDates(ctx, st, rows, opts.TakeoutDir, logger); err != nil {
 		return err
 	}
-	if err := fillGoogleDates(ctx, st, rows, newClient, errOut, logger); err != nil {
+	var recheck []string
+	if opts.Recheck {
+		for _, w := range judgeDates(rows).Wrong {
+			recheck = append(recheck, w.MediaID)
+		}
+	}
+	if err := fillGoogleDates(ctx, st, rows, recheck, newClient, errOut, logger); err != nil {
 		return err
 	}
 	if rows, err = st.GetDateRows(); err != nil {
@@ -262,8 +269,9 @@ func zipTakenDates(ctx context.Context, all, zipRows []store.DateRow, takeoutDir
 }
 
 // fillGoogleDates asks Google for the date of every media ID not yet checked,
-// saving each batch as it arrives so an interrupt loses nothing.
-func fillGoogleDates(ctx context.Context, st *store.Store, rows []store.DateRow,
+// plus the IDs in recheck, saving each batch as it arrives so an interrupt
+// loses nothing.
+func fillGoogleDates(ctx context.Context, st *store.Store, rows []store.DateRow, recheck []string,
 	newClient func() (*photos.Client, error), errOut io.Writer, logger *zap.Logger) error {
 	seen := map[string]bool{}
 	var ids []string
@@ -271,6 +279,12 @@ func fillGoogleDates(ctx context.Context, st *store.Store, rows []store.DateRow,
 		if r.GoogleCheckedAt.IsZero() && !seen[r.MediaID] {
 			seen[r.MediaID] = true
 			ids = append(ids, r.MediaID)
+		}
+	}
+	for _, id := range recheck {
+		if !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
 		}
 	}
 	if len(ids) == 0 {
@@ -370,7 +384,7 @@ func printWrongDatesText(w io.Writer, rep dateReport) {
 				_, _ = fmt.Fprintf(w, "\n  %s: the same photo was uploaded from %s.", d.File, strings.Join(places, "; "))
 			}
 		}
-		_, _ = fmt.Fprint(w, "\n\n  Fix each in Google Photos: open the photo → ⋮ → Edit date & time.\n  Dates are shown in UTC.\n")
+		_, _ = fmt.Fprint(w, "\n\n  Fix each in Google Photos: open the photo → ⋮ → Edit date & time.\n  Dates are shown in UTC.\n  After fixing some, run: photo-migrator wrong-dates --recheck\n")
 	}
 
 	var parts []string
@@ -451,6 +465,7 @@ func printWrongDatesJSON(w io.Writer, rep dateReport) error {
 
 func newWrongDatesCmd() *cobra.Command {
 	var format string
+	var recheck bool
 	cmd := &cobra.Command{
 		Use:   "wrong-dates",
 		Short: "List uploaded photos whose date in Google Photos is not the date taken",
@@ -471,7 +486,8 @@ screen and run 'photo-migrator auth' again.
 
 The Google Photos API cannot change a photo's date after upload, so the dates
 can only be fixed by hand: open the photo in Google Photos, choose
-⋮ → Edit date & time.
+⋮ → Edit date & time. Afterwards, --recheck asks Google again about the
+photos currently listed, so the ones you fixed drop off the list.
 
 Photos not judged are counted at the end: those whose sidecar has no date,
 those Google does not let this tool read (already in your library before
@@ -480,6 +496,7 @@ those not checked yet (for example a zip missing from --takeout-dir).
 
 Flags:
   --takeout-dir <dir>  where the Takeout zips are (or set takeout-dir in the config)
+  --recheck            ask Google again about the photos listed as wrong
   --format json        Emit machine-readable JSON instead of a text table`,
 		RunE: func(cmd *cobra.Command, args []string) (err error) {
 			st, err := store.Open(viperPath("db-path"))
@@ -499,7 +516,7 @@ Flags:
 
 			return runWrongDates(ctx, st, func() (*photos.Client, error) {
 				return buildPhotosClient(viperPath("credentials"), viper.GetFloat64("rate-limit"))
-			}, wrongDatesOpts{TakeoutDir: viperPath("takeout-dir"), Format: format},
+			}, wrongDatesOpts{TakeoutDir: viperPath("takeout-dir"), Format: format, Recheck: recheck},
 				os.Stdout, os.Stderr, buildLogger())
 		},
 	}
@@ -508,5 +525,6 @@ Flags:
 	f.String("credentials", defaultCredentials, "path to OAuth2 credentials.json from Google Cloud Console")
 	f.Float64("rate-limit", defaultRateLimit, "max Google Photos API requests per second")
 	f.StringVar(&format, "format", "text", "output format: text | json")
+	f.BoolVar(&recheck, "recheck", false, "ask Google again about the photos currently listed as wrong")
 	return cmd
 }

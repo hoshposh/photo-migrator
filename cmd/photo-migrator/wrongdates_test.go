@@ -755,3 +755,65 @@ func TestWrongDatesCommand_EmptyLedger(t *testing.T) {
 		t.Errorf("output:\n%s", out)
 	}
 }
+
+// Break caught: --recheck not asking Google again, so a date fixed by hand
+// stays listed; or asking about photos that were not listed.
+func TestWrongDates_RecheckSeesFixedDate(t *testing.T) {
+	f := newWDFixture(t)
+	f.addZip("takeout-001.zip", map[string]string{
+		wdTrip + "a.jpg.supplemental-metadata.json": wdSidecar("a.jpg", wdTaken),
+		wdTrip + "b.jpg.supplemental-metadata.json": wdSidecar("b.jpg", wdTaken),
+	})
+	f.upload("takeout-001.zip", wdTrip+"a.jpg", "Trip", "m-a")
+	f.upload("takeout-001.zip", wdTrip+"b.jpg", "Trip", "m-b")
+	f.google["m-a"] = wdGoogle
+	f.google["m-b"] = wdTaken
+
+	out, _, err := f.run(context.Background(), wrongDatesOpts{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "a.jpg") || !strings.Contains(out, "wrong-dates --recheck") {
+		t.Fatalf("first run must list a.jpg and mention --recheck:\n%s", out)
+	}
+	n := f.requestCount()
+
+	f.google["m-a"] = wdTaken // the user fixed it in Google Photos
+
+	out, _, err = f.run(context.Background(), wrongDatesOpts{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "a.jpg") || f.requestCount() != n {
+		t.Errorf("without Recheck a.jpg must stay listed with no request (requests %d -> %d):\n%s", n, f.requestCount(), out)
+	}
+
+	out, _, err = f.run(context.Background(), wrongDatesOpts{Recheck: true}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.requestCount() != n+1 {
+		t.Fatalf("Recheck made %d requests, want 1", f.requestCount()-n)
+	}
+	if got := f.requests[n]; !reflect.DeepEqual(got, []string{"m-a"}) {
+		t.Errorf("Recheck asked for %v, want only m-a", got)
+	}
+	if strings.Contains(out, "a.jpg") || strings.Contains(out, "--recheck") {
+		t.Errorf("nothing should be listed after the fix:\n%s", out)
+	}
+}
+
+// Break caught: the --recheck hint printed in JSON output.
+func TestWrongDates_RecheckHintIsTextOnly(t *testing.T) {
+	f := newWDFixture(t)
+	f.addZip("takeout-001.zip", map[string]string{wdTrip + "a.jpg.supplemental-metadata.json": wdSidecar("a.jpg", wdTaken)})
+	f.upload("takeout-001.zip", wdTrip+"a.jpg", "Trip", "m-a")
+	f.google["m-a"] = wdGoogle
+	out, _, err := f.run(context.Background(), wrongDatesOpts{Format: "json"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "--recheck") {
+		t.Errorf("JSON output must not carry the hint:\n%s", out)
+	}
+}
