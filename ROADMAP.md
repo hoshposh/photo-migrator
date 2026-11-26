@@ -165,3 +165,40 @@ The Library API cannot change a media item's date after upload: `batchCreate` ta
 - Files already uploaded with the wrong date cannot be corrected through the API, only by hand in Google Photos ("Edit date & time"). Uploading them again would leave the wrongly dated copy in place, because the API cannot delete.
 - Files uploaded before this change have no recorded result. Checking them means listing the app's media items, which needs the read scope from item 1.
 - Sidecar times are in UTC and are written with a `+00:00` offset. The date is correct, but Google Photos may show the time in UTC rather than the local time where the photo was taken.
+
+### 8. Edited copies are uploaded next to their originals
+
+**Problem:** when a photo was edited in Google Photos, Takeout exports both the original (`IMG_x.jpg`) and the edited version (`IMG_x-edited.jpg`, also `-EFFECTS-edited`), each as a separate file. The tool uploads both, so the destination shows the photo twice: once as it was taken and once with the edits. One real Takeout had 1,180 edited copies. The Library API has no way to link an edit to its original.
+
+**Approach:**
+
+- Recognise edited copies by name in `takeout.Classify`: a name ending in `-edited` (optionally `(N)`) before the extension, whose original (the same name without `-edited`) exists. Like RAW pairs (item 6), this must not depend on both files being in the same zip.
+- Add a setting, for example `edited-copies = "both" | "original" | "edited"`, with `both` (the current behaviour) as the default:
+  - `edited` uploads only the edited version, which is what the source library showed.
+  - `original` uploads only the untouched original.
+- Hold back the other file with its own status (for example `edited_pair`), as `raw_pair` does: it doesn't block the zip, `status` counts it, a report lists it (with `--extract`), and setting it back to `pending` releases it.
+
+**Done when:** with `edited-copies = "edited"`, a run uploads each edited copy and holds back its original (and the reverse with `original`), and the default `both` behaves exactly as today.
+
+**Limits:**
+
+- Files already uploaded are not removed (the API cannot delete). The setting only affects files not yet uploaded.
+- Uploading only the edited version loses the unedited original from the destination, unless the held-back files are uploaded later by hand.
+
+### 9. iPhone Live Photo videos are uploaded as separate videos
+
+**Problem:** Takeout exports an iPhone Live Photo as a still image (`IMG_7297.HEIC`) plus a short video with the same name (`IMG_7297.MP4`); older Pixel motion photos come out the same way (`MVIMG_x.jpg` + `MVIMG_x.MP4`). The tool already holds back Pixel motion-photo video halves (`….MP`, `….MP.COVER`, status `motion_video`), but it does not recognise these: each video is uploaded as a separate 1–3 second video next to its still. One real Takeout had 818 such videos. The Library API cannot rebuild a Live Photo or motion photo.
+
+**Approach:**
+
+- Recognise the video half in `takeout.Classify`: a `.mp4` / `.mov` file with an image of the same stem (`.heic`, `.jpg`, `.jpeg`) in the same folder. Set `MotionPart`, so it is held back with `StatusMotionVideo` and listed by `motion-videos`, exactly like the Pixel halves.
+- Because this needs the folder's other names, check it where the walker and `scan` already see the whole folder (or the zip listing), not from the file name alone.
+- A video with no matching image is uploaded as today.
+
+**Done when:** a run holds back `IMG_7297.MP4` next to `IMG_7297.HEIC` (status `motion_video`, listed by `motion-videos`) while still uploading a standalone `.MP4`, and `scan --skipped` counts the held-back videos.
+
+**Limits:**
+
+- Videos already uploaded stay in the destination (the API cannot delete). Removing them means deleting them by hand in Google Photos.
+- The still image keeps no motion in the destination; the held-back video can be extracted with `motion-videos --extract` if wanted.
+- A real video that happens to share its stem with a photo (rare) would be held back too; it can be released by setting its status back to `pending`.
