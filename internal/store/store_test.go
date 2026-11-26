@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/pressly/goose/v3"
 )
@@ -227,5 +228,66 @@ func TestMigration_HoldsBackExistingLockedFolderRows(t *testing.T) {
 		if got != w {
 			t.Errorf("%s: status = %q, want %q", p, got, w)
 		}
+	}
+}
+
+// Break caught: the DSN used _journal_mode / _busy_timeout, which the pure-Go
+// driver ignores, so the ledger ran in rollback-journal mode with no busy wait.
+func TestOpen_UsesWALAndBusyTimeout(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "m.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+
+	var mode string
+	if err := st.db.QueryRow(`PRAGMA journal_mode`).Scan(&mode); err != nil {
+		t.Fatal(err)
+	}
+	if mode != "wal" {
+		t.Errorf("journal_mode = %q, want wal", mode)
+	}
+	var timeout int
+	if err := st.db.QueryRow(`PRAGMA busy_timeout`).Scan(&timeout); err != nil {
+		t.Fatal(err)
+	}
+	if timeout != 5000 {
+		t.Errorf("busy_timeout = %d, want 5000", timeout)
+	}
+}
+
+// Break caught: a second process writing while `run` holds a write
+// transaction failing at once with "database is locked" instead of waiting.
+func TestOpen_SecondConnectionWaitsForLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "m.db")
+	a, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = a.Close() }()
+	b, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = b.Close() }()
+
+	tx, err := a.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`UPDATE zip_archives SET status = status`); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		done <- tx.Commit()
+	}()
+
+	if err := b.RegisterZip("/z.zip"); err != nil {
+		t.Errorf("RegisterZip while another connection holds the write lock: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }

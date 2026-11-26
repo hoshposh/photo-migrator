@@ -52,7 +52,10 @@ type Store struct {
 // Open opens (or creates) the SQLite database at path, then runs any pending
 // goose migrations.
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", fmt.Sprintf("%s?_journal_mode=WAL&_busy_timeout=5000", path))
+	// modernc.org/sqlite only honours _pragma=... DSN parameters (it ignores
+	// _journal_mode and _busy_timeout). WAL plus a 5 s busy timeout let a second
+	// process, such as a report, write while `run` does.
+	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}

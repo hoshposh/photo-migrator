@@ -417,6 +417,8 @@ sqlite3 migrator.db "SELECT status, COUNT(*) FROM media_items GROUP BY status"
 sqlite3 migrator.db "SELECT zip_path, status FROM zip_archives ORDER BY zip_path"
 ```
 
+The database uses SQLite's WAL mode, so `migrator.db-wal` and `migrator.db-shm` files appear next to it while it is open. They belong with the database; keep them together if you move it. To copy the database while a run is going, use `sqlite3 migrator.db ".backup copy.db"`, not `cp`.
+
 ---
 
 ## Rate limits
