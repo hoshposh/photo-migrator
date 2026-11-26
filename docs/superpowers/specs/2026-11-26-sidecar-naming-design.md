@@ -50,8 +50,8 @@ The rules run after the existing four strategies, in this order, on the media fi
 0. **Fix strategy 3:** skip candidates ending in `(N).json` unless the media name has the same `(N)` before its extension.
 1. **Numbered duplicate:** for `X(N).ext`, the sidecar starts with `X.ext.` and ends with `(N).json`.
 2. **Edited copy:** for a name ending in `-edited` (optionally followed by `(N)`) before the extension, look up the name without `-edited` using all rules (so `-EFFECTS-edited.jpg` finds `-EFFECTS.jpg`'s sidecar, and `-edited(1)` finds the `(1)` sidecar).
-3. **Live Photo / motion video:** for a `.mp4`/`.mov` file, find an image in the same folder with the same stem (`.heic`, `.jpg`, `.jpeg`) and use that image's sidecar (found with all rules).
-4. **Name cut short:** a sidecar whose name without `.json` (and without a trailing `(N)`, which must equal the media's `(N)`) is a prefix of the media's name, at least 30 characters long; the longest such prefix wins, and a tie means no match.
+3. **Live Photo / motion video:** for a `.mp4`/`.mov` file, look for sidecars of an image with the same stem (`<stem>.heic`, `.jpg` or `.jpeg`, any case) and use that image's sidecar (found with all rules). This works from the sidecar names alone, because the zip index stores only JSON names; exactly one image must yield a sidecar.
+4. **Name cut short:** a sidecar whose name without `.json` (and without a trailing `(N)`, which must equal the media's `(N)`) is a prefix of the media's name, at least 30 characters long, **and** whose `title` (the full original name, which Takeout keeps) starts with the media's name without its extension. The title check stops two photos that share a long prefix (`…_1687607112.jpg`, `…_1687607113.jpg`) from both taking one cut-short sidecar; checked on the real data, where titles hold the full names (`…_COV.jpg` → title `…_COVER.jpg`).
 
 Every rule returns a sidecar only when exactly one candidate fits.
 
