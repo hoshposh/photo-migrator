@@ -144,3 +144,33 @@ func TestSidecarIndex_StopsWhenCancelled(t *testing.T) {
 		t.Errorf("err = %v, want context.Canceled", err)
 	}
 }
+
+func TestSidecarIndex_TakeoutNames(t *testing.T) {
+	for _, g := range takeoutNameCases {
+		t.Run(g.name, func(t *testing.T) {
+			const folder = "Takeout/Google Photos/Photos from 2019/"
+			files := map[string]string{}
+			for name, title := range g.sidecars {
+				files[folder+name] = takeoutNameJSON(name, title)
+			}
+			for media := range g.want {
+				files[folder+media] = "x"
+			}
+			zp := filepath.Join(t.TempDir(), "takeout-001.zip")
+			writeZipFiles(t, zp, files)
+			ix, failed, err := BuildSidecarIndex(context.Background(), []string{zp})
+			if err != nil || len(failed) != 0 {
+				t.Fatalf("BuildSidecarIndex: failed=%v err=%v", failed, err)
+			}
+			for media, wantFile := range g.want {
+				got := ""
+				if s := ix.Lookup(folder + media); s != nil {
+					got = s.Description
+				}
+				if got != wantFile {
+					t.Errorf("Lookup(%s) = %q; want %q", media, got, wantFile)
+				}
+			}
+		})
+	}
+}
