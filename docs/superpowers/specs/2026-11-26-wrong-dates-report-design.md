@@ -173,3 +173,15 @@ Running the report on the user's library changed several decisions above.
 **`--recheck`.** The manual check in prerequisite 2 passed: a date fixed by hand in Google Photos is visible through `batchGet`. So `--recheck` was built, and asks Google again only about the photos currently listed as wrong.
 
 **Follow-ups.** About 1,600 of the user's photos have no sidecar date because `FindSidecar` misses some Takeout names: `-edited` copies, `(1)` duplicates, and motion-photo MP4/MP files. When that is fixed, rows recorded with `taken_time_source = 'none'` must be reset so they are looked up again.
+
+## Addition: links and an HTML checklist
+
+Found while trying the report on real data: Google Photos' search box does not find a photo by its exact file name. It offers many near matches that must be checked one by one, so with ~316 photos to fix, searching is not a workable way to reach each one.
+
+The Library API returns a `productUrl` for every media item the app can read: a `https://photos.google.com/lr/…` link that opens that exact photo for the signed-in user. Every photo the report lists is readable by the app, so every listed photo can have a link.
+
+- **Ledger:** a new column `media_items.google_url` (migration `00008`), stored with Google's date by `SetGoogleDates` and by the upload batcher from the `batchCreate` response. NULL = not known.
+- **Fetching:** before printing, any listed (wrong) photo without a stored URL is fetched from Google along with the other IDs to fetch (≈7 requests for 316 photos). A photo that still has no URL is listed without a link.
+- **`--format html`** writes one self-contained page to stdout (`wrong-dates --format html > wrong-dates.html`): a counter, short instructions, and one row per wrong photo with a checkbox, file name, album, the date to set in the local time zone of the computer that made the page with its offset (for example `29 Jul 2018, 2:17 PM (GMT-04:00)`), the same instant in UTC, Google's current date, and an **Open in Google Photos** link. Ticked boxes are remembered in the browser's localStorage, keyed by media ID, so the list can be worked through over several sittings; a counter shows how many are done. The page loads nothing from the network and escapes every name (Go's `html/template`). No thumbnails: Google's image URLs expire after about an hour.
+- **`--format json`** gains a `url` field. The text output is unchanged.
+- After fixing photos, `wrong-dates --recheck --format html > wrong-dates.html` regenerates the page without the fixed photos.

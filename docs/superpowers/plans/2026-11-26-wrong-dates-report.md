@@ -515,3 +515,53 @@ Expected: PASS.
 git add cmd/photo-migrator/wrongdates.go cmd/photo-migrator/wrongdates_test.go README.md
 git commit -m "wrong-dates: --recheck asks Google again for photos listed as wrong"
 ```
+
+---
+
+### Task 9: Links and an HTML checklist (`--format html`)
+
+Spec: the "Addition: links and an HTML checklist" section of the design doc.
+
+**Files:**
+- Create: `internal/store/migrations/00008_google_url.sql`
+- Modify: `internal/store/dates.go` (`DateRow.GoogleURL`, `GoogleDate.URL`, `GetDateRows`, `SetGoogleDates`), `internal/store/dates_test.go`
+- Modify: `internal/photos/mediaitems.go` (`ItemDate.ProductURL`), `internal/photos/upload.go` (`BatchCreateResult.ProductURL`), their tests
+- Modify: `internal/pipeline/batcher.go` (pass the URL to `SetGoogleDates`)
+- Modify: `cmd/photo-migrator/wrongdates.go` (URL in `wrongDate`, fetch missing URLs, JSON `url`, `--format html` accepted)
+- Create: `cmd/photo-migrator/wrongdates_html.go` (the printer and its embedded template), tests in `cmd/photo-migrator/wrongdates_test.go` or a new `wrongdates_html_test.go`
+- Modify: `README.md` (wrong-dates section), `CLAUDE.md` (wrong-dates bullet: one clause)
+
+**Interfaces:**
+- Consumes: everything already in `wrongdates.go`, `dates.go`, `mediaitems.go`.
+- Produces:
+
+```go
+// store
+type DateRow struct { /* existing fields */ GoogleURL string } // "" = unknown
+type GoogleDate struct { /* existing fields */ URL string }    // stored only when non-empty
+
+// photos
+type ItemDate struct { /* existing fields */ ProductURL string }          // mediaItem.productUrl
+type BatchCreateResult struct { /* existing fields */ ProductURL string } // mediaItem.productUrl
+
+// cmd/photo-migrator
+type wrongDate struct { /* existing fields */ URL string }
+func printWrongDatesHTML(w io.Writer, rep dateReport, loc *time.Location, generated time.Time) error
+```
+
+**Rules:**
+- Migration 00008: `ALTER TABLE media_items ADD COLUMN google_url TEXT;` Down drops it. Never edit 00006 or 00007.
+- `SetGoogleDates` writes `google_url` only when `URL != ""` (a Missing answer or an answer without a URL leaves an existing URL alone).
+- `wrongDate.URL` comes from the shown row, falling back to any row of that media ID with a URL.
+- In `runWrongDates`, the media IDs of currently-wrong photos with no URL on any of their rows are added to the IDs to fetch (same union and dedupe as `--recheck`), so one run fills them. All existing chunk error handling applies unchanged.
+- `--format` accepts `text`, `json`, `html`; the error message lists all three.
+- HTML page: built with `html/template` from one embedded template string; inline CSS and JS only; no external URLs except the per-photo `productUrl` links (which open in a new tab, `rel="noopener"`). Each row has `<input type="checkbox" data-id="<media ID>">`; JS restores and saves ticks under one localStorage key (`photo-migrator-wrong-dates`), and updates a "N / M done" counter. Date to set: `ShouldBe.In(loc)` formatted `2 Jan 2006, 3:04 PM (GMT-07:00)`; also show UTC (`2006-01-02 15:04 UTC`) and Google's current date. A row without a URL shows "no link" instead of the link. Show the "Not judged" counts and the generated time. Nothing listed → a short "No uploaded photos have a wrong date." page.
+
+- [ ] **Step 1: Write the failing tests**
+  - store: `TestSetGoogleDates_URL` — a URL is stored on every row with the media ID; a later `SetGoogleDates` with `URL == ""` (date update, and Missing) keeps it. `TestMigration00008_GoogleURL` — opens a DB at version 7 with a row, migrates, `GetDateRows` returns `GoogleURL == ""`.
+  - photos: `TestBatchGet_ProductURL` (field parsed); `TestBatchCreate_ReturnsProductURL`.
+  - cmd: `TestWrongDates_FetchesMissingURLs` — a wrong photo whose Google date is stored but has no URL → one run sends one batchGet for exactly that ID, and the JSON output carries its `url`. `TestWrongDates_HTML` — run with `Format: "html"` over two wrong photos (one with a URL, one without) and a file named `<b>&"x".jpg`: output contains the link with `target="_blank"` and `rel="noopener"`, "no link" for the other, the escaped name (`&lt;b&gt;&amp;`), the local date `29 Jul 2018, 2:17 PM (GMT-04:00)` for taken `2018-07-29T18:17:00Z` with `loc = time.FixedZone("", -4*3600)`, `data-id="<media ID>"`, and no `http` URL other than the `productUrl` links (no `<script src`, no `<link href`). `TestWrongDates_FormatRejected` — `--format xml` error lists text, json and html.
+- [ ] **Step 2: Run them to verify they fail**
+- [ ] **Step 3: Implement** (store, photos, batcher, wrongdates.go, wrongdates_html.go; `newWrongDatesCmd` passes `time.Local` and `time.Now()` to the HTML printer)
+- [ ] **Step 4: `task ci`**, then README (a `--format html` example and one paragraph on the checklist page and localStorage) and the CLAUDE.md clause
+- [ ] **Step 5: Commit** — `wrong-dates: links to each photo and an HTML checklist`
