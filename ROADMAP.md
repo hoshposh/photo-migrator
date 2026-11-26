@@ -138,7 +138,7 @@ Every command that changes the database should:
 
 ### 7. Uploaded files show the upload date instead of the date taken
 
-**Status:** the `wrong-dates` report is built; finding and fixing the causes is not.
+**Status:** the `wrong-dates` report is built, including `--recheck`, which asks Google again about the photos listed as wrong after they are fixed by hand. Finding and fixing the causes is not done. The first known cause: `FindSidecar` misses some Takeout sidecar names (`-edited` copies, `(1)` duplicates, motion-photo MP4/MP files), so those photos have no date to write.
 
 **Problem:** some photos arrive in the destination account dated the day this tool uploaded them, not the day they were taken, so they appear in the wrong place in the timeline. `restore-metadata` already writes the sidecar's date into each file with exiftool before upload, so these are files where that did not work. Likely causes, not yet confirmed:
 
@@ -156,7 +156,7 @@ The Library API cannot change a media item's date after upload: `batchCreate` ta
 - Check the date Google actually assigned. The `batchCreate` response includes the new item's `mediaMetadata.creationTime` (confirm this); compare it with the sidecar's `photoTakenTime` and record a mismatch, allowing for time-zone differences.
 - Fix the causes found where the format allows it, for example by writing the date tags Google Photos reads for that format (QuickTime dates for videos, XMP for PNG).
 - Log one summary line per zip ("no date written for N files"), with per-file lines at debug level.
-- Add a `wrong-dates` report (like `large-files`, sharing `newManualFilesCmd`) listing uploaded files whose date did not take effect, with the date they should have, so the user can correct them by hand.
+- Add a `wrong-dates` report listing uploaded files whose date did not take effect, with the date they should have, so the user can correct them by hand.
 
 **Done when:** after a run, every uploaded file either shows its original date in Google Photos or is listed by `wrong-dates` with the date it should have, and the log says per zip how many files had no date written and why.
 

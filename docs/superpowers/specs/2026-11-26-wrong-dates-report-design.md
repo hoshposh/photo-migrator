@@ -92,7 +92,7 @@ A file is listed when both dates are known and they differ by **more than 24 hou
 Not listed, but counted in a summary line under the report:
 
 - photos with no sidecar date (`taken_time_source = 'none'`): cannot be judged;
-- photos Google would not return (`google_missing = 1`). Labelled "deleted, or not created by this app": an upload that Google deduplicated against a photo this app did not create can't be read with the `appcreateddata` scope;
+- photos Google would not return (`google_missing = 1`). Labelled "already in your library before this tool, or deleted": an upload that Google deduplicated against a photo already in the account gets that photo's ID, which this app did not create and can't read with the `appcreateddata` scope;
 - uploaded photos not checked yet (only if the check was interrupted).
 
 ### Finding expected dates (`taken_time`)
@@ -137,7 +137,7 @@ Text output sketch:
   …
 
   Fix each in Google Photos: open the photo → ⋮ → Edit date & time.
-  Not judged: 41 without a sidecar date, 3 deleted or not created by this app.
+  Not judged: 41 without a sidecar date, 3 already in your library before this tool, or deleted.
   After fixing some, run: photo-migrator wrong-dates --recheck
 ```
 
@@ -157,3 +157,19 @@ Dates are shown in UTC (the sidecar's own time zone), with a note saying so.
 - Whether to extend `manualReport` or write a sibling printer.
 - Exact names of store methods and constants.
 - Column order and widths in the text output.
+
+## What the first real run changed
+
+Running the report on the user's library changed several decisions above.
+
+**Code 3 means not readable.** `batchGet` answered status code 3 (INVALID_ARGUMENT, "The provided ID does not match any media items") for 72% of the user's media IDs. A `mediaItems.list` call showed only about 4,300 items created by this app, and a sampled photo that Google would not return had its correct date in Google Photos. So these are uploads Google deduplicated against photos already in the account: it handed back the existing items' IDs, which the app did not create and cannot read. Codes 3, 5 and 7 are all counted as not readable, under the label "already in your library before this tool, or deleted". Any other code fails the batch, since it may be transient.
+
+**Failures.** A rejected sign-in stops the command, as it does for uploads. A batch that fails for any other reason is skipped with a warning, and its photos stay unchecked until the next run; after 3 failed batches in a row the run stops, so an outage does not retry every batch. A photo Google returns without a date also stays unchecked rather than being judged.
+
+**Deadlines.** One run hung for 8 hours on a request that never got an answer. Every API call except byte uploads now has a 2-minute deadline per attempt, including reading the response, and a timed-out attempt is retried like a network error. The OAuth HTTP client also drops dead connections (no response headers within 2 minutes, or an HTTP/2 connection that stops answering pings). There is no total timeout, so large, slow uploads still work.
+
+**Which copy is shown.** When rows share a media ID, the report now prefers a copy that has a sidecar date, and among those one in an album; only if no copy has a sidecar date does it fall back to the album copy, then the first. Otherwise an album copy whose sidecar was not found hid a photo whose other copy had its date. "First" is by the path inside the zip, not the staging path. The text output no longer lists every copy; the JSON still does.
+
+**`--recheck`.** The manual check in prerequisite 2 passed: a date fixed by hand in Google Photos is visible through `batchGet`. So `--recheck` was built, and asks Google again only about the photos currently listed as wrong.
+
+**Follow-ups.** About 1,600 of the user's photos have no sidecar date because `FindSidecar` misses some Takeout names: `-edited` copies, `(1)` duplicates, and motion-photo MP4/MP files. When that is fixed, rows recorded with `taken_time_source = 'none'` must be reset so they are looked up again.
